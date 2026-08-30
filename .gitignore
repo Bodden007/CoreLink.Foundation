@@ -1,0 +1,39 @@
+# Build
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# VS Code
+.vscode/
+
+# JetBrains
+.idea/
+*.sln.iml
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+
+# Test results
+TestResults/
+*.trx
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Native binaries
+*.dll
+*.so
+*.dylib
+*.pdb
