@@ -2,4 +2,5 @@
   <Project Path="CoreLink.Client.TestHost/CoreLink.Client.TestHost.csproj" />
   <Project Path="CoreLink.Client/CoreLink.Client.csproj" />
   <Project Path="CoreLink.Maps/CoreLink.Maps.csproj" />
+  <Project Path="CoreLink.Transport/CoreLink.Transport.csproj" />
 </Solution>
