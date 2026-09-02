@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CoreLink.Client\CoreLink.Client.csproj" />
+    <ProjectReference Include="..\CoreLink.Transport\CoreLink.Transport.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
