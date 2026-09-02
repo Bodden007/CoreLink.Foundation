@@ -14,7 +14,7 @@ namespace CoreLink.Transport.Modbus;
 /// Наружу не раскрываются внутренние transport-компоненты:
 /// все операции проходят через единый диспетчер приоритетов.
 /// </summary>
-public sealed class ModbusTransportSession : IDisposable
+public sealed class ModbusTransportSession : IAsyncDisposable
 {
     private readonly ModbusConnectionManager _connectionManager;
     private readonly ModbusRequestDispatcher _dispatcher;
@@ -100,13 +100,22 @@ OnPollingError;
     /// Такой порядок не позволяет poller поставить новый запрос
     /// после начала остановки transport-сессии.
     /// </summary>
-    public void Stop()
+    /// <summary>
+    /// Асинхронно останавливает transport-сессию.
+    ///
+    /// Сначала прекращается polling, чтобы он больше
+    /// не создавал новые запросы.
+    ///
+    /// После полного завершения poller останавливается
+    /// единственный dispatcher worker.
+    /// </summary>
+    public async Task StopAsync()
     {
         if (_disposed)
             return;
 
-        _poller.Stop();
-        _dispatcher.Stop();
+        await _poller.StopAsync();
+        await _dispatcher.StopAsync();
     }
 
     /// <summary>
@@ -214,7 +223,14 @@ OnPollingError;
     /// <summary>
     /// Освобождает всю Modbus TCP-сессию сверху вниз.
     /// </summary>
-    public void Dispose()
+    /// <summary>
+    /// Асинхронно завершает Modbus TCP-сессию сверху вниз.
+    ///
+    /// Сначала прекращается производство запросов,
+    /// затем завершается dispatcher, и только после этого
+    /// уничтожается физическое TCP-соединение.
+    /// </summary>
+    public async ValueTask DisposeAsync()
     {
         if (_disposed)
             return;
@@ -225,8 +241,9 @@ OnPollingError;
         _poller.PollingError -=
             OnPollingError;
 
-        _poller.Dispose();
-        _dispatcher.Dispose();
+        await _poller.DisposeAsync();
+        await _dispatcher.DisposeAsync();
+
         _connectionManager.Dispose();
 
         _disposed = true;

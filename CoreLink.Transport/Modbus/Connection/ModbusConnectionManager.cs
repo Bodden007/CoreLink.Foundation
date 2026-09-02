@@ -228,8 +228,37 @@ internal sealed class ModbusConnectionManager : IDisposable
                     _config.Port,
                     timeoutCts.Token);
             }
-            catch
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
             {
+                // Отмена пришла от владельца transport-операции.
+                // Её нельзя превращать в обычную ошибку соединения,
+                // иначе shutdown/cancellation теряют свою семантику.
+                tcpClient.Dispose();
+
+                throw;
+            }
+            catch (OperationCanceledException)
+                when (timeoutCts.IsCancellationRequested)
+            {
+                // Истёк именно ConnectTimeoutMs.
+                // Для вызывающей стороны это обычная неудачная
+                // попытка установить TCP-соединение.
+                tcpClient.Dispose();
+
+                return false;
+            }
+            catch (SocketException)
+            {
+                // Сетевой отказ подключения: порт закрыт,
+                // host недоступен, соединение отклонено и т.п.
+                tcpClient.Dispose();
+
+                return false;
+            }
+            catch (IOException)
+            {
+                // Ошибка транспортного потока при установлении соединения.
                 tcpClient.Dispose();
 
                 return false;
@@ -385,6 +414,19 @@ internal sealed class ModbusConnectionManager : IDisposable
     /// FIXME: после завершения переноса отдельно пересмотреть
     /// диагностику и постоянный timeout-контракт CoreLink.Transport.
     /// </summary>
+    /// <summary>
+    /// Выполняет Modbus-запрос и контролирует его максимальную
+    /// продолжительность через RequestTimeoutMs.
+    ///
+    /// NModbus не поддерживает CancellationToken для выполняющегося
+    /// Modbus-запроса, поэтому при timeout операция отменяется
+    /// уничтожением принадлежащей ей TCP-сессии.
+    ///
+    /// Request lock не освобождается до фактического завершения
+    /// старого NModbus Task. Это гарантирует, что следующий запрос
+    /// не сможет начать работу с новой TCP-сессией одновременно
+    /// с хвостом предыдущего запроса.
+    /// </summary>
     private async Task<TResult>
         ExecuteRequestWithDiagnosticsAsync<TResult>(
             Func<Task<TResult>> request)
@@ -418,6 +460,8 @@ internal sealed class ModbusConnectionManager : IDisposable
 
             if (completedTask != requestTask)
             {
+                stopwatch.Stop();
+
                 CurrentRequestMs =
                     stopwatch.ElapsedMilliseconds;
 
@@ -431,6 +475,29 @@ internal sealed class ModbusConnectionManager : IDisposable
 
                 HungRequestCount++;
                 RequestIsHung = true;
+
+                // NModbus не позволяет отменить уже выполняющийся
+                // Modbus-запрос через CancellationToken.
+                //
+                // Поэтому уничтожаем именно ту TCP-сессию,
+                // на которой завис текущий запрос.
+                //
+                // Новый connect до выхода из request lock
+                // выполниться не сможет.
+                CloseConnection();
+
+                // После закрытия сокета NModbus Task должен завершиться
+                // успехом, отменой или исключением.
+                //
+                // Нам важно дождаться его физического завершения,
+                // но результат уже не имеет значения: с точки зрения
+                // transport-контракта запрос превысил timeout.
+                //
+                // SuppressThrowing используется только для наблюдения
+                // завершения старого Task. Исключение timeout ниже
+                // остаётся основной причиной отказа операции.
+                await ((Task)requestTask).ConfigureAwait(
+                    ConfigureAwaitOptions.SuppressThrowing);
 
                 throw new TimeoutException(
                     $"Modbus request timeout after " +

@@ -37,8 +37,8 @@ internal static class ModbusTransportSmokeTest
             InputRegisterCount = 2
         };
 
-        using ModbusTransportSession transport =
-            new(config);
+        await using ModbusTransportSession transport =
+       new(config);
 
         long pollCount = 0;
 
@@ -111,7 +111,7 @@ internal static class ModbusTransportSmokeTest
             }
         }
 
-        transport.Stop();
+        await transport.StopAsync();
 
         Console.WriteLine();
         Console.WriteLine("Transport stopped.");

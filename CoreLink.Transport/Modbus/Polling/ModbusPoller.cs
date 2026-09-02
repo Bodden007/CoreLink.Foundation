@@ -11,7 +11,7 @@ namespace CoreLink.Transport.Modbus.Polling;
 /// Все операции передаются диспетчеру, который определяет
 /// порядок выполнения относительно write и single read.
 /// </summary>
-internal sealed class ModbusPoller : IDisposable
+internal sealed class ModbusPoller : IAsyncDisposable
 {
     private readonly ModbusRequestDispatcher _dispatcher;
     private readonly ModbusConnectionConfig _config;
@@ -140,16 +140,41 @@ internal sealed class ModbusPoller : IDisposable
     /// Уже переданный диспетчеру Modbus-запрос не прерывается:
     /// он завершается по обычным правилам transport слоя.
     /// </summary>
-    public void Stop()
+    /// <summary>
+    /// Асинхронно останавливает создание новых polling-запросов.
+    ///
+    /// Если polling уже ожидает переданный dispatcher запрос,
+    /// метод дожидается завершения текущего polling-цикла.
+    /// Сам вызывающий поток при этом не блокируется.
+    /// </summary>
+    public async Task StopAsync()
     {
         if (_pollingCts is null)
             return;
 
-        _pollingCts.Cancel();
+        CancellationTokenSource pollingCts =
+            _pollingCts;
 
-        _pollingCts.Dispose();
+        Task? pollingTask =
+            _pollingTask;
+
+        pollingCts.Cancel();
+
+        if (pollingTask is not null)
+        {
+            try
+            {
+                await pollingTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // Штатное завершение polling.
+            }
+        }
+
+        pollingCts.Dispose();
+
         _pollingCts = null;
-
         _pollingTask = null;
     }
 
@@ -159,8 +184,14 @@ internal sealed class ModbusPoller : IDisposable
     /// Диспетчер здесь не уничтожается, поскольку его lifetime
     /// принадлежит владельцу всей Modbus-сессии.
     /// </summary>
-    public void Dispose()
+    /// <summary>
+    /// Асинхронно завершает polling.
+    ///
+    /// Dispatcher здесь не уничтожается:
+    /// его lifetime принадлежит ModbusTransportSession.
+    /// </summary>
+    public async ValueTask DisposeAsync()
     {
-        Stop();
+        await StopAsync();
     }
 }

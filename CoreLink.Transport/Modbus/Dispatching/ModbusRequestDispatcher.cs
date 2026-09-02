@@ -15,7 +15,7 @@ namespace CoreLink.Transport.Modbus.Dispatching;
 /// Уже выполняющийся Modbus-запрос никогда не прерывается.
 /// Приоритет применяется только при выборе следующей операции.
 /// </summary>
-internal sealed class ModbusRequestDispatcher : IDisposable
+internal sealed class ModbusRequestDispatcher : IAsyncDisposable
 {
     private readonly ModbusConnectionManager _connectionManager;
 
@@ -393,23 +393,41 @@ internal sealed class ModbusRequestDispatcher : IDisposable
     /// Останавливает worker и завершает оставшиеся
     /// необработанные запросы отменой.
     /// </summary>
-    public void Stop()
+    /// <summary>
+    /// Асинхронно останавливает worker.
+    ///
+    /// Новые запросы после начала остановки больше не исполняются.
+    /// Уже выполняющийся transport-запрос завершается по обычным
+    /// правилам cancellation/timeout.
+    ///
+    /// Метод не блокирует вызывающий поток синхронным ожиданием Task.
+    /// </summary>
+    public async Task StopAsync()
     {
         if (_workerCts is null)
             return;
 
-        _workerCts.Cancel();
+        CancellationTokenSource workerCts =
+            _workerCts;
 
-        try
+        Task? workerTask =
+            _workerTask;
+
+        workerCts.Cancel();
+
+        if (workerTask is not null)
         {
-            _workerTask?.GetAwaiter().GetResult();
-        }
-        catch (OperationCanceledException)
-        {
-            // Штатное завершение worker.
+            try
+            {
+                await workerTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // Штатное завершение worker.
+            }
         }
 
-        _workerCts.Dispose();
+        workerCts.Dispose();
 
         _workerCts = null;
         _workerTask = null;
@@ -461,9 +479,13 @@ internal sealed class ModbusRequestDispatcher : IDisposable
     /// Останавливает диспетчер и освобождает принадлежащий ему
     /// примитив сигнализации.
     /// </summary>
-    public void Dispose()
+    /// <summary>
+    /// Асинхронно завершает dispatcher и освобождает
+    /// принадлежащий ему примитив сигнализации.
+    /// </summary>
+    public async ValueTask DisposeAsync()
     {
-        Stop();
+        await StopAsync();
 
         _requestSignal.Dispose();
     }
