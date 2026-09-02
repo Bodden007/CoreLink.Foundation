@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net.Sockets;
 using NModbus;
 using CoreLink.Transport.Modbus.Configuration;
+using CoreLink.Transport.Modbus.Results;
 
 namespace CoreLink.Transport.Modbus.Connection;
 
@@ -13,6 +14,10 @@ namespace CoreLink.Transport.Modbus.Connection;
 ///
 /// Подключение восстанавливается по необходимости.
 /// Все Modbus-запросы выполняются последовательно через request lock.
+///
+/// Штатные сетевые и Modbus-ошибки не пробрасываются наружу
+/// исключениями: вызывающая сторона получает детерминированный
+/// ModbusTransportStatus.
 /// </summary>
 internal sealed class ModbusConnectionManager : IDisposable
 {
@@ -20,9 +25,6 @@ internal sealed class ModbusConnectionManager : IDisposable
 
     /// <summary>
     /// Сериализует создание и восстановление TCP-сессии.
-    ///
-    /// Если несколько операций одновременно обнаружили отсутствие
-    /// соединения, реально выполнять connect должен только один поток.
     /// </summary>
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
 
@@ -44,9 +46,6 @@ internal sealed class ModbusConnectionManager : IDisposable
 
     /// <summary>
     /// Текущий TCP-клиент Modbus-сессии.
-    ///
-    /// Создаётся при успешном подключении и уничтожается
-    /// при сетевой ошибке, timeout или закрытии менеджера.
     /// </summary>
     private TcpClient? _tcpClient;
 
@@ -82,7 +81,6 @@ internal sealed class ModbusConnectionManager : IDisposable
     /// <summary>
     /// Создаёт менеджер одной Modbus TCP-сессии.
     ///
-    /// Конструктор только сохраняет конфигурацию.
     /// TCP-соединение открывается лениво при первом запросе.
     /// </summary>
     public ModbusConnectionManager(
@@ -94,101 +92,130 @@ internal sealed class ModbusConnectionManager : IDisposable
     /// <summary>
     /// Читает последовательный блок Input Registers.
     ///
-    /// Запрос выполняется через общую TCP-сессию и сериализуется
-    /// относительно остальных операций чтения и записи.
-    ///
-    /// Ошибка соединения или Modbus-запроса передаётся
-    /// вызывающей стороне и не маскируется пустым массивом.
+    /// Пустой массив не используется как признак ошибки:
+    /// при отказе возвращается ModbusReadResult со статусом ошибки.
     /// </summary>
-    public async Task<ushort[]> ReadInputRegistersAsync(
+    public async Task<ModbusReadResult> ReadInputRegistersAsync(
         byte slaveId,
         ushort startAddress,
         ushort count,
         CancellationToken cancellationToken = default)
     {
-        return await ExecuteRequestAsync(
-            master => master.ReadInputRegistersAsync(
-                slaveId,
-                startAddress,
-                count),
-            cancellationToken);
+        (ModbusTransportStatus status, ushort[]? data) =
+            await ExecuteRequestAsync(
+                master => master.ReadInputRegistersAsync(
+                    slaveId,
+                    startAddress,
+                    count),
+                cancellationToken);
+
+        return new ModbusReadResult
+        {
+            Status = status,
+            Data = status == ModbusTransportStatus.Ok
+                ? data
+                : null
+        };
     }
 
     /// <summary>
     /// Записывает один Holding Register.
     ///
-    /// Использует ту же TCP-сессию и тот же IModbusMaster,
-    /// что и операции polling/read.
-    ///
-    /// Ошибка соединения или записи передаётся вызывающей стороне.
+    /// Client получает детерминированный статус выполнения
+    /// и не обязан анализировать исключения TcpClient/NModbus.
     /// </summary>
-    public async Task WriteSingleRegisterAsync(
+    public async Task<ModbusWriteResult> WriteSingleRegisterAsync(
         byte slaveId,
         ushort address,
         ushort value,
         CancellationToken cancellationToken = default)
     {
-        await ExecuteRequestAsync(
-            master => master.WriteSingleRegisterAsync(
-                slaveId,
-                address,
-                value),
-            cancellationToken);
+        ModbusTransportStatus status =
+            await ExecuteRequestAsync(
+                master => master.WriteSingleRegisterAsync(
+                    slaveId,
+                    address,
+                    value),
+                cancellationToken);
+
+        return new ModbusWriteResult
+        {
+            Status = status
+        };
     }
 
     /// <summary>
     /// Записывает последовательный блок Holding Registers.
     ///
-    /// Весь Modbus-запрос выполняется атомарно относительно
-    /// остальных операций текущей TCP-сессии через request lock.
-    ///
-    /// Ошибка соединения или записи передаётся вызывающей стороне.
+    /// Весь Modbus-запрос выполняется последовательно относительно
+    /// остальных операций текущей TCP-сессии.
     /// </summary>
-    public async Task WriteMultipleRegistersAsync(
+    public async Task<ModbusWriteResult> WriteMultipleRegistersAsync(
         byte slaveId,
         ushort startAddress,
         ushort[] values,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(values);
+        if (values is null)
+        {
+            return new ModbusWriteResult
+            {
+                Status = ModbusTransportStatus.Faulted
+            };
+        }
 
-        await ExecuteRequestAsync(
-            master => master.WriteMultipleRegistersAsync(
-                slaveId,
-                startAddress,
-                values),
-            cancellationToken);
+        ModbusTransportStatus status =
+            await ExecuteRequestAsync(
+                master => master.WriteMultipleRegistersAsync(
+                    slaveId,
+                    startAddress,
+                    values),
+                cancellationToken);
+
+        return new ModbusWriteResult
+        {
+            Status = status
+        };
     }
 
     /// <summary>
     /// Гарантирует наличие активной Modbus TCP-сессии.
     ///
-    /// Если соединения нет, выполняется попытка подключения.
-    /// Параллельные попытки connect сериализуются через connection lock.
-    ///
-    /// Частота повторных подключений ограничивается ReconnectDelayMs,
-    /// чтобы при недоступном ПЛК не создавать reconnect loop.
+    /// Transport самостоятельно ограничивает частоту reconnect.
+    /// Любая незавершённая локальная TcpClient-сессия уничтожается
+    /// до выхода из метода.
     /// </summary>
-    private async Task<bool> EnsureConnectedAsync(
+    private async Task<ModbusTransportStatus> EnsureConnectedAsync(
         CancellationToken cancellationToken)
     {
         if (_master is not null &&
             _tcpClient?.Connected == true)
         {
-            return true;
+            return ModbusTransportStatus.Ok;
         }
-
-        await _connectionLock.WaitAsync(
-            cancellationToken);
 
         try
         {
-            // Повторная проверка обязательна после входа в lock:
-            // другой поток мог уже восстановить соединение.
+            await _connectionLock.WaitAsync(
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return ModbusTransportStatus.Cancelled;
+        }
+        catch (Exception)
+        {
+            return ModbusTransportStatus.Faulted;
+        }
+
+        try
+        {
+            // Повторная проверка после lock обязательна:
+            // другой запрос мог уже восстановить соединение.
             if (_master is not null &&
                 _tcpClient?.Connected == true)
             {
-                return true;
+                return ModbusTransportStatus.Ok;
             }
 
             TimeSpan reconnectDelay =
@@ -202,76 +229,82 @@ internal sealed class ModbusConnectionManager : IDisposable
             if (_lastConnectAttemptUtc != DateTime.MinValue &&
                 elapsed < reconnectDelay)
             {
-                return false;
+                return ModbusTransportStatus.Disconnected;
             }
 
             _lastConnectAttemptUtc =
                 DateTime.UtcNow;
 
-            // Старая сессия перед новым connect больше
-            // не должна использоваться.
             CloseConnection();
 
-            TcpClient tcpClient = new();
-
-            using CancellationTokenSource timeoutCts =
-                CancellationTokenSource.CreateLinkedTokenSource(
-                    cancellationToken);
-
-            timeoutCts.CancelAfter(
-                _config.ConnectTimeoutMs);
+            TcpClient? tcpClient = new();
 
             try
             {
-                await tcpClient.ConnectAsync(
-                    _config.Host,
-                    _config.Port,
-                    timeoutCts.Token);
+                using CancellationTokenSource timeoutCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(
+                        cancellationToken);
+
+                timeoutCts.CancelAfter(
+                    _config.ConnectTimeoutMs);
+
+                try
+                {
+                    await tcpClient.ConnectAsync(
+                        _config.Host,
+                        _config.Port,
+                        timeoutCts.Token);
+                }
+                catch (OperationCanceledException)
+                    when (cancellationToken.IsCancellationRequested)
+                {
+                    return ModbusTransportStatus.Cancelled;
+                }
+                catch (OperationCanceledException)
+                {
+                    return ModbusTransportStatus.ConnectTimeout;
+                }
+                catch (SocketException)
+                {
+                    return ModbusTransportStatus.Disconnected;
+                }
+                catch (IOException)
+                {
+                    return ModbusTransportStatus.Disconnected;
+                }
+                catch (Exception)
+                {
+                    return ModbusTransportStatus.Faulted;
+                }
+
+                try
+                {
+                    ModbusFactory factory = new();
+
+                    IModbusMaster master =
+                        factory.CreateMaster(
+                            tcpClient);
+
+                    // Передача владения происходит только после того,
+                    // как TCP и NModbus master полностью созданы.
+                    _tcpClient = tcpClient;
+                    _master = master;
+
+                    tcpClient = null;
+
+                    return ModbusTransportStatus.Ok;
+                }
+                catch (Exception)
+                {
+                    return ModbusTransportStatus.Faulted;
+                }
             }
-            catch (OperationCanceledException)
-                when (cancellationToken.IsCancellationRequested)
+            finally
             {
-                // Отмена пришла от владельца transport-операции.
-                // Её нельзя превращать в обычную ошибку соединения,
-                // иначе shutdown/cancellation теряют свою семантику.
-                tcpClient.Dispose();
-
-                throw;
+                // Если владение TcpClient не было передано полям
+                // менеджера, локальный сокет обязательно уничтожается.
+                tcpClient?.Dispose();
             }
-            catch (OperationCanceledException)
-                when (timeoutCts.IsCancellationRequested)
-            {
-                // Истёк именно ConnectTimeoutMs.
-                // Для вызывающей стороны это обычная неудачная
-                // попытка установить TCP-соединение.
-                tcpClient.Dispose();
-
-                return false;
-            }
-            catch (SocketException)
-            {
-                // Сетевой отказ подключения: порт закрыт,
-                // host недоступен, соединение отклонено и т.п.
-                tcpClient.Dispose();
-
-                return false;
-            }
-            catch (IOException)
-            {
-                // Ошибка транспортного потока при установлении соединения.
-                tcpClient.Dispose();
-
-                return false;
-            }
-
-            ModbusFactory factory = new();
-
-            _tcpClient = tcpClient;
-            _master =
-                factory.CreateMaster(
-                    tcpClient);
-
-            return true;
         }
         finally
         {
@@ -280,51 +313,68 @@ internal sealed class ModbusConnectionManager : IDisposable
     }
 
     /// <summary>
-    /// Выполняет Modbus-запрос, не возвращающий значение.
+    /// Выполняет Modbus-запрос без возвращаемых данных.
     ///
-    /// Перед запросом гарантирует наличие соединения,
-    /// затем получает exclusive-доступ к текущему IModbusMaster.
-    ///
-    /// Ошибка не маскируется успешным завершением Task.
-    /// При ошибке текущая TCP-сессия закрывается, а исключение
-    /// передаётся вызывающей стороне.
+    /// Request lock охватывает connect/reconnect и сам запрос,
+    /// поэтому состояние текущей TCP-сессии не может измениться
+    /// другим запросом между проверкой соединения и выполнением I/O.
     /// </summary>
-    private async Task ExecuteRequestAsync(
+    private async Task<ModbusTransportStatus> ExecuteRequestAsync(
         Func<IModbusMaster, Task> request,
         CancellationToken cancellationToken)
     {
-        bool connected =
-            await EnsureConnectedAsync(
-                cancellationToken);
-
-        if (!connected || _master is null)
-        {
-            throw new IOException(
-                $"Modbus TCP connection unavailable: " +
-                $"{_config.Host}:{_config.Port}.");
-        }
-
         // FIXME: временная диагностика перенесена из Nitrogen.
         RequestLockWaitCount++;
 
-        await _requestLock.WaitAsync(
-            cancellationToken);
+        try
+        {
+            await _requestLock.WaitAsync(
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return ModbusTransportStatus.Cancelled;
+        }
+        catch (Exception)
+        {
+            return ModbusTransportStatus.Faulted;
+        }
 
         // FIXME: временная диагностика перенесена из Nitrogen.
         RequestLockEnterCount++;
 
         try
         {
-            await ExecuteRequestWithDiagnosticsAsync(
-                () => request(_master));
-        }
-        catch
-        {
-            // После ошибки текущая TCP-сессия больше
-            // не считается пригодной для следующих запросов.
-            CloseConnection();
+            ModbusTransportStatus connectionStatus =
+                await EnsureConnectedAsync(
+                    cancellationToken);
 
-            throw;
+            if (connectionStatus != ModbusTransportStatus.Ok)
+            {
+                return connectionStatus;
+            }
+
+            IModbusMaster? master = _master;
+
+            if (master is null)
+            {
+                CloseConnection();
+
+                return ModbusTransportStatus.Faulted;
+            }
+
+            ModbusTransportStatus requestStatus =
+                await ExecuteRequestWithDiagnosticsAsync(
+                    () => request(master));
+
+            if (requestStatus != ModbusTransportStatus.Ok)
+            {
+                // Любой неуспешный Modbus-запрос инвалидирует
+                // текущую сессию. Следующий запрос сам выполнит reconnect.
+                CloseConnection();
+            }
+
+            return requestStatus;
         }
         finally
         {
@@ -333,51 +383,81 @@ internal sealed class ModbusConnectionManager : IDisposable
     }
 
     /// <summary>
-    /// Выполняет Modbus-запрос, возвращающий значение.
+    /// Выполняет Modbus-запрос, возвращающий данные.
     ///
-    /// Перед запросом гарантирует наличие соединения.
-    /// Все запросы текущей сессии сериализуются через request lock.
-    ///
-    /// Ошибка не преобразуется в null/default.
-    /// При ошибке текущая TCP-сессия закрывается, а исключение
-    /// передаётся вызывающей стороне.
+    /// При ошибке result всегда default/null, а причина
+    /// однозначно задаётся ModbusTransportStatus.
     /// </summary>
-    private async Task<TResult> ExecuteRequestAsync<TResult>(
-        Func<IModbusMaster, Task<TResult>> request,
-        CancellationToken cancellationToken)
+    private async Task<(ModbusTransportStatus Status, TResult? Result)>
+        ExecuteRequestAsync<TResult>(
+            Func<IModbusMaster, Task<TResult>> request,
+            CancellationToken cancellationToken)
     {
-        bool connected =
-            await EnsureConnectedAsync(
-                cancellationToken);
-
-        if (!connected || _master is null)
-        {
-            throw new IOException(
-                $"Modbus TCP connection unavailable: " +
-                $"{_config.Host}:{_config.Port}.");
-        }
-
         // FIXME: временная диагностика перенесена из Nitrogen.
         RequestLockWaitCount++;
 
-        await _requestLock.WaitAsync(
-            cancellationToken);
+        try
+        {
+            await _requestLock.WaitAsync(
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return (
+                ModbusTransportStatus.Cancelled,
+                default);
+        }
+        catch (Exception)
+        {
+            return (
+                ModbusTransportStatus.Faulted,
+                default);
+        }
 
         // FIXME: временная диагностика перенесена из Nitrogen.
         RequestLockEnterCount++;
 
         try
         {
-            return await ExecuteRequestWithDiagnosticsAsync(
-                () => request(_master));
-        }
-        catch
-        {
-            // После ошибки текущая TCP-сессия больше
-            // не считается пригодной для следующих запросов.
-            CloseConnection();
+            ModbusTransportStatus connectionStatus =
+                await EnsureConnectedAsync(
+                    cancellationToken);
 
-            throw;
+            if (connectionStatus != ModbusTransportStatus.Ok)
+            {
+                return (
+                    connectionStatus,
+                    default);
+            }
+
+            IModbusMaster? master = _master;
+
+            if (master is null)
+            {
+                CloseConnection();
+
+                return (
+                    ModbusTransportStatus.Faulted,
+                    default);
+            }
+
+            (ModbusTransportStatus status, TResult? result) =
+                await ExecuteRequestWithDiagnosticsAsync(
+                    () => request(master));
+
+            if (status != ModbusTransportStatus.Ok)
+            {
+                // Следующий запрос должен работать уже с новой сессией.
+                CloseConnection();
+
+                return (
+                    status,
+                    default);
+            }
+
+            return (
+                ModbusTransportStatus.Ok,
+                result);
         }
         finally
         {
@@ -386,48 +466,37 @@ internal sealed class ModbusConnectionManager : IDisposable
     }
 
     /// <summary>
-    /// Выполняет Modbus-запрос без результата через временный
+    /// Выполняет Modbus-запрос без результата через общий
     /// диагностический механизм контроля длительности операции.
     /// </summary>
-    private async Task ExecuteRequestWithDiagnosticsAsync(
-        Func<Task> request)
+    private async Task<ModbusTransportStatus>
+        ExecuteRequestWithDiagnosticsAsync(
+            Func<Task> request)
     {
-        await ExecuteRequestWithDiagnosticsAsync(
-            async () =>
-            {
-                await request();
+        (ModbusTransportStatus status, bool? _) =
+            await ExecuteRequestWithDiagnosticsAsync(
+                async () =>
+                {
+                    await request();
 
-                return true;
-            });
+                    return true;
+                });
+
+        return status;
     }
 
     /// <summary>
     /// Выполняет Modbus-запрос и контролирует его максимальную
     /// продолжительность через RequestTimeoutMs.
     ///
-    /// Механизм перенесён из Nitrogen для сохранения проверенного
-    /// поведения транспорта на первом этапе миграции.
+    /// NModbus не поддерживает CancellationToken для уже выполняющегося
+    /// запроса. При timeout текущая TCP-сессия уничтожается, после чего
+    /// метод дожидается физического завершения старого NModbus Task.
     ///
-    /// При превышении RequestTimeoutMs запрос считается зависшим
-    /// и вызывающая сторона получает TimeoutException.
-    ///
-    /// FIXME: после завершения переноса отдельно пересмотреть
-    /// диагностику и постоянный timeout-контракт CoreLink.Transport.
+    /// Исключения TcpClient/NModbus не выходят из метода:
+    /// они преобразуются в детерминированный transport status.
     /// </summary>
-    /// <summary>
-    /// Выполняет Modbus-запрос и контролирует его максимальную
-    /// продолжительность через RequestTimeoutMs.
-    ///
-    /// NModbus не поддерживает CancellationToken для выполняющегося
-    /// Modbus-запроса, поэтому при timeout операция отменяется
-    /// уничтожением принадлежащей ей TCP-сессии.
-    ///
-    /// Request lock не освобождается до фактического завершения
-    /// старого NModbus Task. Это гарантирует, что следующий запрос
-    /// не сможет начать работу с новой TCP-сессией одновременно
-    /// с хвостом предыдущего запроса.
-    /// </summary>
-    private async Task<TResult>
+    private async Task<(ModbusTransportStatus Status, TResult? Result)>
         ExecuteRequestWithDiagnosticsAsync<TResult>(
             Func<Task<TResult>> request)
     {
@@ -446,8 +515,22 @@ internal sealed class ModbusConnectionManager : IDisposable
 
         try
         {
-            Task<TResult> requestTask =
-                request();
+            Task<TResult> requestTask;
+
+            try
+            {
+                requestTask = request();
+            }
+            catch (Exception)
+            {
+                stopwatch.Stop();
+                UpdateRequestDuration(
+                    stopwatch.ElapsedMilliseconds);
+
+                return (
+                    ModbusTransportStatus.RequestFailed,
+                    default);
+            }
 
             Task timeoutTask =
                 Task.Delay(
@@ -462,70 +545,103 @@ internal sealed class ModbusConnectionManager : IDisposable
             {
                 stopwatch.Stop();
 
-                CurrentRequestMs =
-                    stopwatch.ElapsedMilliseconds;
-
-                LastRequestMs =
-                    stopwatch.ElapsedMilliseconds;
-
-                MaxRequestMs =
-                    Math.Max(
-                        MaxRequestMs,
-                        LastRequestMs);
+                UpdateRequestDuration(
+                    stopwatch.ElapsedMilliseconds);
 
                 HungRequestCount++;
                 RequestIsHung = true;
 
-                // NModbus не позволяет отменить уже выполняющийся
-                // Modbus-запрос через CancellationToken.
-                //
-                // Поэтому уничтожаем именно ту TCP-сессию,
-                // на которой завис текущий запрос.
-                //
-                // Новый connect до выхода из request lock
-                // выполниться не сможет.
+                // Закрытие сокета является механизмом физического
+                // прерывания зависшего NModbus-запроса.
                 CloseConnection();
 
-                // После закрытия сокета NModbus Task должен завершиться
-                // успехом, отменой или исключением.
-                //
-                // Нам важно дождаться его физического завершения,
-                // но результат уже не имеет значения: с точки зрения
-                // transport-контракта запрос превысил timeout.
-                //
-                // SuppressThrowing используется только для наблюдения
-                // завершения старого Task. Исключение timeout ниже
-                // остаётся основной причиной отказа операции.
+                // Request lock остаётся захваченным до полного
+                // завершения старого Task, поэтому новая TCP-сессия
+                // не сможет использоваться одновременно со старой.
                 await ((Task)requestTask).ConfigureAwait(
                     ConfigureAwaitOptions.SuppressThrowing);
 
-                throw new TimeoutException(
-                    $"Modbus request timeout after " +
-                    $"{_config.RequestTimeoutMs} ms.");
+                RecoveredRequestCount++;
+
+                return (
+                    ModbusTransportStatus.RequestTimeout,
+                    default);
             }
 
-            TResult result =
-                await requestTask;
+            try
+            {
+                TResult result =
+                    await requestTask;
 
-            stopwatch.Stop();
+                stopwatch.Stop();
 
-            CurrentRequestMs =
-                stopwatch.ElapsedMilliseconds;
+                UpdateRequestDuration(
+                    stopwatch.ElapsedMilliseconds);
 
-            LastRequestMs =
-                stopwatch.ElapsedMilliseconds;
+                LastSuccessTime =
+                    DateTime.Now;
 
-            MaxRequestMs =
-                Math.Max(
-                    MaxRequestMs,
-                    LastRequestMs);
+                RequestCompletedCount++;
 
-            LastSuccessTime =
-                DateTime.Now;
+                return (
+                    ModbusTransportStatus.Ok,
+                    result);
+            }
+            catch (OperationCanceledException)
+            {
+                stopwatch.Stop();
 
-            RequestCompletedCount++;
+                UpdateRequestDuration(
+                    stopwatch.ElapsedMilliseconds);
 
-            return result;
+                return (
+                    ModbusTransportStatus.Cancelled,
+                    default);
+            }
+            catch (SocketException)
+            {
+                stopwatch.Stop();
+
+                UpdateRequestDuration(
+                    stopwatch.ElapsedMilliseconds);
+
+                return (
+                    ModbusTransportStatus.Disconnected,
+                    default);
+            }
+            catch (IOException)
+            {
+                stopwatch.Stop();
+
+                UpdateRequestDuration(
+                    stopwatch.ElapsedMilliseconds);
+
+                return (
+                    ModbusTransportStatus.Disconnected,
+                    default);
+            }
+            catch (TimeoutException)
+            {
+                stopwatch.Stop();
+
+                UpdateRequestDuration(
+                    stopwatch.ElapsedMilliseconds);
+
+                return (
+                    ModbusTransportStatus.RequestTimeout,
+                    default);
+            }
+            catch (Exception)
+            {
+                stopwatch.Stop();
+
+                UpdateRequestDuration(
+                    stopwatch.ElapsedMilliseconds);
+
+                return (
+                    ModbusTransportStatus.RequestFailed,
+                    default);
+            }
         }
         finally
         {
@@ -536,27 +652,62 @@ internal sealed class ModbusConnectionManager : IDisposable
     }
 
     /// <summary>
-    /// Закрывает текущую Modbus TCP-сессию.
-    ///
-    /// IModbusMaster и TcpClient уничтожаются вместе,
-    /// поскольку относятся к одной физической TCP-сессии.
-    ///
-    /// После закрытия следующий запрос сможет инициировать reconnect.
+    /// Обновляет временную диагностику длительности запроса
+    /// в одном месте для успешных и неуспешных операций.
     /// </summary>
-    private void CloseConnection()
+    private void UpdateRequestDuration(
+        long elapsedMilliseconds)
     {
-        _master?.Dispose();
-        _master = null;
+        CurrentRequestMs =
+            elapsedMilliseconds;
 
-        _tcpClient?.Dispose();
-        _tcpClient = null;
+        LastRequestMs =
+            elapsedMilliseconds;
+
+        MaxRequestMs =
+            Math.Max(
+                MaxRequestMs,
+                LastRequestMs);
     }
 
     /// <summary>
-    /// Освобождает сетевые ресурсы и примитивы
-    /// синхронизации текущего менеджера.
+    /// Закрывает текущую Modbus TCP-сессию.
     ///
-    /// После Dispose экземпляр больше не должен использоваться.
+    /// Метод не пробрасывает ошибки Dispose наружу:
+    /// после его вызова состояние менеджера всегда считается
+    /// Disconnected независимо от поведения уничтожаемых объектов.
+    /// </summary>
+    private void CloseConnection()
+    {
+        IModbusMaster? master = _master;
+        TcpClient? tcpClient = _tcpClient;
+
+        _master = null;
+        _tcpClient = null;
+
+        try
+        {
+            master?.Dispose();
+        }
+        catch (Exception)
+        {
+            // Cleanup не должен ломать детерминированное
+            // состояние Transport.
+        }
+
+        try
+        {
+            tcpClient?.Dispose();
+        }
+        catch (Exception)
+        {
+            // Cleanup не должен ломать детерминированное
+            // состояние Transport.
+        }
+    }
+
+    /// <summary>
+    /// Освобождает сетевые ресурсы и примитивы синхронизации.
     /// </summary>
     public void Dispose()
     {

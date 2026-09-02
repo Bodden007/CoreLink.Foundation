@@ -1,5 +1,6 @@
 using CoreLink.Transport.Modbus;
 using CoreLink.Transport.Modbus.Configuration;
+using CoreLink.Transport.Modbus.Results;
 
 namespace CoreLink.Client.TestHost;
 
@@ -23,8 +24,8 @@ internal static class ModbusTransportSmokeTest
     {
         ModbusConnectionConfig config = new()
         {
-            Host = "192.168.0.10",
-            Port = 502,
+            Host = "127.0.0.1",
+            Port = 1502,
             SlaveId = 255,
 
             ConnectTimeoutMs = 3000,
@@ -38,7 +39,7 @@ internal static class ModbusTransportSmokeTest
         };
 
         await using ModbusTransportSession transport =
-       new(config);
+            new(config);
 
         long pollCount = 0;
 
@@ -54,13 +55,12 @@ internal static class ModbusTransportSmokeTest
                 $"[{string.Join(", ", registers)}]");
         };
 
-        transport.TransportError += exception =>
+        transport.TransportStatusChanged += status =>
         {
             Console.WriteLine(
-                $"POLL ERROR   " +
+                $"POLL STATUS  " +
                 $"{DateTime.Now:HH:mm:ss.fff} " +
-                $"{exception.GetType().Name}: " +
-                $"{exception.Message}");
+                $"{status}");
         };
 
         Console.WriteLine();
@@ -142,23 +142,23 @@ internal static class ModbusTransportSmokeTest
             $"{started:HH:mm:ss.fff} " +
             $"address={address} value={value}");
 
-        try
-        {
+        ModbusWriteResult result =
             await transport.WriteSingleRegisterAsync(
                 address,
                 value);
 
+        if (result.Ok)
+        {
             Console.WriteLine(
                 $"WRITE DONE   " +
                 $"{DateTime.Now:HH:mm:ss.fff}");
         }
-        catch (Exception exception)
+        else
         {
             Console.WriteLine(
                 $"WRITE FAILED " +
                 $"{DateTime.Now:HH:mm:ss.fff} " +
-                $"{exception.GetType().Name}: " +
-                $"{exception.Message}");
+                $"status={result.Status}");
         }
     }
 
@@ -169,7 +169,7 @@ internal static class ModbusTransportSmokeTest
     /// но имеет меньший приоритет, чем штатный polling.
     /// </summary>
     private static async Task ExecuteSingleReadAsync(
-    ModbusTransportSession transport)
+        ModbusTransportSession transport)
     {
         const ushort startAddress = 8;
         const ushort count = 2;
@@ -182,25 +182,25 @@ internal static class ModbusTransportSmokeTest
             $"{started:HH:mm:ss.fff} " +
             $"start={startAddress} count={count}");
 
-        try
-        {
-            ushort[] registers =
-                await transport.ReadSingleAsync(
-                    startAddress,
-                    count);
+        ModbusReadResult result =
+            await transport.ReadSingleAsync(
+                startAddress,
+                count);
 
+        if (result.Ok &&
+            result.Data is not null)
+        {
             Console.WriteLine(
                 $"SINGLE DONE   " +
                 $"{DateTime.Now:HH:mm:ss.fff} " +
-                $"[{string.Join(", ", registers)}]");
+                $"[{string.Join(", ", result.Data)}]");
         }
-        catch (Exception exception)
+        else
         {
             Console.WriteLine(
                 $"SINGLE FAILED " +
                 $"{DateTime.Now:HH:mm:ss.fff} " +
-                $"{exception.GetType().Name}: " +
-                $"{exception.Message}");
+                $"status={result.Status}");
         }
     }
 }

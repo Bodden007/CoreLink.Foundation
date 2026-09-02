@@ -2,6 +2,7 @@ using CoreLink.Transport.Modbus.Configuration;
 using CoreLink.Transport.Modbus.Connection;
 using CoreLink.Transport.Modbus.Dispatching;
 using CoreLink.Transport.Modbus.Polling;
+using CoreLink.Transport.Modbus.Results;
 
 namespace CoreLink.Transport.Modbus;
 
@@ -11,8 +12,8 @@ namespace CoreLink.Transport.Modbus;
 /// Сессия владеет TCP-соединением, диспетчером запросов
 /// и постоянным циклом polling.
 ///
-/// Наружу не раскрываются внутренние transport-компоненты:
-/// все операции проходят через единый диспетчер приоритетов.
+/// Штатные transport-ошибки возвращаются через
+/// ModbusTransportStatus и не требуют анализа исключений.
 /// </summary>
 public sealed class ModbusTransportSession : IAsyncDisposable
 {
@@ -32,17 +33,19 @@ public sealed class ModbusTransportSession : IAsyncDisposable
     public event Action<ushort[]>? RegistersReceived;
 
     /// <summary>
-    /// Вызывается при ошибке штатного polling.
+    /// Публикует неуспешный статус штатного polling.
     ///
-    /// Ошибка не означает остановку transport-сессии:
-    /// poller продолжает выполнять следующие попытки.
+    /// Ошибка одного запроса не останавливает transport-сессию.
+    /// Следующая попытка снова проходит через Transport,
+    /// который при необходимости выполняет reconnect.
     /// </summary>
-    public event Action<Exception>? TransportError;
+    public event Action<ModbusTransportStatus>? TransportStatusChanged;
 
     /// <summary>
     /// Показывает, запущен ли постоянный polling.
     /// </summary>
-    public bool IsRunning => _poller.IsRunning;
+    public bool IsRunning =>
+        _poller.IsRunning;
 
     /// <summary>
     /// Создаёт одну Modbus TCP-сессию.
@@ -59,7 +62,8 @@ public sealed class ModbusTransportSession : IAsyncDisposable
         _config = config;
 
         _connectionManager =
-            new ModbusConnectionManager(config);
+            new ModbusConnectionManager(
+                config);
 
         _dispatcher =
             new ModbusRequestDispatcher(
@@ -73,12 +77,12 @@ public sealed class ModbusTransportSession : IAsyncDisposable
         _poller.RegistersReceived +=
             OnRegistersReceived;
 
-        _poller.PollingError +=
-OnPollingError;
+        _poller.PollingStatusChanged +=
+            OnPollingStatusChanged;
     }
 
     /// <summary>
-    /// Запускает диспетчер запросов и постоянный polling.
+    /// Запускает dispatcher и постоянный polling.
     ///
     /// Dispatcher запускается первым, чтобы первый polling-запрос
     /// сразу имел работающего исполнителя.
@@ -94,19 +98,9 @@ OnPollingError;
     }
 
     /// <summary>
-    /// Останавливает создание новых polling-запросов,
-    /// затем завершает диспетчер.
-    ///
-    /// Такой порядок не позволяет poller поставить новый запрос
-    /// после начала остановки transport-сессии.
-    /// </summary>
-    /// <summary>
     /// Асинхронно останавливает transport-сессию.
     ///
-    /// Сначала прекращается polling, чтобы он больше
-    /// не создавал новые запросы.
-    ///
-    /// После полного завершения poller останавливается
+    /// Сначала прекращается polling, затем завершается
     /// единственный dispatcher worker.
     /// </summary>
     public async Task StopAsync()
@@ -122,10 +116,9 @@ OnPollingError;
     /// Ставит запись одного Holding Register
     /// в высокоприоритетную очередь.
     ///
-    /// Write обслуживается раньше polling и single read
-    /// при выборе следующей Modbus-операции.
+    /// Результат содержит детерминированный transport status.
     /// </summary>
-    public Task WriteSingleRegisterAsync(
+    public Task<ModbusWriteResult> WriteSingleRegisterAsync(
         ushort address,
         ushort value)
     {
@@ -140,8 +133,10 @@ OnPollingError;
     /// <summary>
     /// Ставит запись блока Holding Registers
     /// в высокоприоритетную очередь.
+    ///
+    /// Результат содержит детерминированный transport status.
     /// </summary>
-    public Task WriteMultipleRegistersAsync(
+    public Task<ModbusWriteResult> WriteMultipleRegistersAsync(
         ushort startAddress,
         ushort[] values)
     {
@@ -156,10 +151,10 @@ OnPollingError;
     /// <summary>
     /// Выполняет одиночное чтение Input Registers.
     ///
-    /// Single read имеет самый низкий приоритет и выполняется
-    /// только после ожидающих write и штатного polling.
+    /// Single read имеет самый низкий приоритет.
+    /// При ошибке Data == null, а причина содержится в Status.
     /// </summary>
-    public Task<ushort[]> ReadSingleAsync(
+    public Task<ModbusReadResult> ReadSingleAsync(
         ushort startAddress,
         ushort count)
     {
@@ -182,17 +177,20 @@ OnPollingError;
     }
 
     /// <summary>
-    /// Передаёт ошибку polling владельцу transport-сессии.
+    /// Передаёт transport-status polling владельцу сессии.
     /// </summary>
-    private void OnPollingError(
-        Exception exception)
+    private void OnPollingStatusChanged(
+        ModbusTransportStatus status)
     {
-        TransportError?.Invoke(
-            exception);
+        TransportStatusChanged?.Invoke(
+            status);
     }
 
     /// <summary>
-    /// Проверяет, что сессия может принимать новые операции.
+    /// Проверяет lifecycle сессии перед постановкой новой операции.
+    ///
+    /// Ошибка использования API не является сетевым состоянием
+    /// и поэтому не преобразуется в ModbusTransportStatus.
     /// </summary>
     private void ThrowIfNotAvailable()
     {
@@ -211,9 +209,8 @@ OnPollingError;
     /// Возвращает Unit Identifier текущей сессии.
     ///
     /// FIXME:
-    /// SlaveId временно извлекается через отдельное поле сессии.
     /// После окончательной фиксации transport API убрать дублирование
-    /// параметра slaveId во внутренних методах.
+    /// slaveId во внутренних вызовах.
     /// </summary>
     private byte GetSlaveId()
     {
@@ -221,14 +218,10 @@ OnPollingError;
     }
 
     /// <summary>
-    /// Освобождает всю Modbus TCP-сессию сверху вниз.
-    /// </summary>
-    /// <summary>
     /// Асинхронно завершает Modbus TCP-сессию сверху вниз.
     ///
     /// Сначала прекращается производство запросов,
-    /// затем завершается dispatcher, и только после этого
-    /// уничтожается физическое TCP-соединение.
+    /// затем dispatcher, после чего уничтожается TCP-сессия.
     /// </summary>
     public async ValueTask DisposeAsync()
     {
@@ -238,8 +231,8 @@ OnPollingError;
         _poller.RegistersReceived -=
             OnRegistersReceived;
 
-        _poller.PollingError -=
-            OnPollingError;
+        _poller.PollingStatusChanged -=
+            OnPollingStatusChanged;
 
         await _poller.DisposeAsync();
         await _dispatcher.DisposeAsync();

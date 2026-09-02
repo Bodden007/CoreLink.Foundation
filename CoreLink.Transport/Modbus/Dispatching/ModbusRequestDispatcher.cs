@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using CoreLink.Transport.Modbus.Connection;
+using CoreLink.Transport.Modbus.Results;
 
 namespace CoreLink.Transport.Modbus.Dispatching;
 
@@ -14,6 +15,10 @@ namespace CoreLink.Transport.Modbus.Dispatching;
 ///
 /// Уже выполняющийся Modbus-запрос никогда не прерывается.
 /// Приоритет применяется только при выборе следующей операции.
+///
+/// Dispatcher не преобразует transport-status обратно в исключения:
+/// результат ModbusConnectionManager передаётся вызывающей стороне
+/// в детерминированном виде.
 /// </summary>
 internal sealed class ModbusRequestDispatcher : IAsyncDisposable
 {
@@ -97,13 +102,13 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     /// Добавляет запись одного Holding Register
     /// в высокоприоритетную очередь.
     /// </summary>
-    public Task WriteSingleRegisterAsync(
+    public Task<ModbusWriteResult> WriteSingleRegisterAsync(
         byte slaveId,
         ushort address,
         ushort value)
     {
-        TaskCompletionSource<bool> completion =
-            CreateCompletionSource<bool>();
+        TaskCompletionSource<ModbusWriteResult> completion =
+            CreateCompletionSource<ModbusWriteResult>();
 
         _writeRequests.Enqueue(
             WriteRequest.CreateSingle(
@@ -124,15 +129,15 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     /// Массив копируется при постановке в очередь, чтобы вызывающая
     /// сторона не могла изменить данные до фактической отправки.
     /// </summary>
-    public Task WriteMultipleRegistersAsync(
+    public Task<ModbusWriteResult> WriteMultipleRegistersAsync(
         byte slaveId,
         ushort startAddress,
         ushort[] values)
     {
         ArgumentNullException.ThrowIfNull(values);
 
-        TaskCompletionSource<bool> completion =
-            CreateCompletionSource<bool>();
+        TaskCompletionSource<ModbusWriteResult> completion =
+            CreateCompletionSource<ModbusWriteResult>();
 
         ushort[] valuesCopy =
             (ushort[])values.Clone();
@@ -154,13 +159,13 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     ///
     /// Polling имеет приоритет ниже write, но выше одиночного чтения.
     /// </summary>
-    public Task<ushort[]> ReadPollingAsync(
+    public Task<ModbusReadResult> ReadPollingAsync(
         byte slaveId,
         ushort startAddress,
         ushort count)
     {
-        TaskCompletionSource<ushort[]> completion =
-            CreateCompletionSource<ushort[]>();
+        TaskCompletionSource<ModbusReadResult> completion =
+            CreateCompletionSource<ModbusReadResult>();
 
         _pollRequests.Enqueue(
             new ReadRequest(
@@ -180,13 +185,13 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     /// Используется для операций, которые не должны задерживать
     /// штатный поток данных.
     /// </summary>
-    public Task<ushort[]> ReadSingleAsync(
+    public Task<ModbusReadResult> ReadSingleAsync(
         byte slaveId,
         ushort startAddress,
         ushort count)
     {
-        TaskCompletionSource<ushort[]> completion =
-            CreateCompletionSource<ushort[]>();
+        TaskCompletionSource<ModbusReadResult> completion =
+            CreateCompletionSource<ModbusReadResult>();
 
         _singleReadRequests.Enqueue(
             new ReadRequest(
@@ -231,8 +236,7 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         }
         finally
         {
-            CancelPendingRequests(
-                cancellationToken);
+            CompletePendingRequestsAsCancelled();
         }
     }
 
@@ -314,93 +318,79 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     }
 
     /// <summary>
-    /// Выполняет одну команду записи через существующий
-    /// ModbusConnectionManager.
+    /// Выполняет одну команду записи через ModbusConnectionManager.
+    ///
+    /// Результат manager передаётся без преобразования в исключение.
     /// </summary>
     private async Task ExecuteWriteAsync(
         WriteRequest request,
         CancellationToken cancellationToken)
     {
-        try
+        ModbusWriteResult result;
+
+        if (cancellationToken.IsCancellationRequested)
         {
-            if (request.Values is null)
-            {
+            result = CreateCancelledWriteResult();
+        }
+        else if (request.Values is null)
+        {
+            result =
                 await _connectionManager.WriteSingleRegisterAsync(
                     request.SlaveId,
                     request.Address,
                     request.Value,
                     cancellationToken);
-            }
-            else
-            {
+        }
+        else
+        {
+            result =
                 await _connectionManager.WriteMultipleRegistersAsync(
                     request.SlaveId,
                     request.Address,
                     request.Values,
                     cancellationToken);
-            }
+        }
 
-            request.Completion.TrySetResult(
-                true);
-        }
-        catch (OperationCanceledException)
-            when (cancellationToken.IsCancellationRequested)
-        {
-            request.Completion.TrySetCanceled(
-                cancellationToken);
-        }
-        catch (Exception exception)
-        {
-            request.Completion.TrySetException(
-                exception);
-        }
+        request.Completion.TrySetResult(
+            result);
     }
 
     /// <summary>
-    /// Выполняет одну операцию чтения через существующий
-    /// ModbusConnectionManager.
+    /// Выполняет одну операцию чтения через ModbusConnectionManager.
+    ///
+    /// Пустой массив не используется как признак отказа:
+    /// status и Data передаются вызывающей стороне как единый результат.
     /// </summary>
     private async Task ExecuteReadAsync(
         ReadRequest request,
         CancellationToken cancellationToken)
     {
-        try
+        ModbusReadResult result;
+
+        if (cancellationToken.IsCancellationRequested)
         {
-            ushort[] registers =
+            result = CreateCancelledReadResult();
+        }
+        else
+        {
+            result =
                 await _connectionManager.ReadInputRegistersAsync(
                     request.SlaveId,
                     request.StartAddress,
                     request.Count,
                     cancellationToken);
+        }
 
-            request.Completion.TrySetResult(
-                registers);
-        }
-        catch (OperationCanceledException)
-            when (cancellationToken.IsCancellationRequested)
-        {
-            request.Completion.TrySetCanceled(
-                cancellationToken);
-        }
-        catch (Exception exception)
-        {
-            request.Completion.TrySetException(
-                exception);
-        }
+        request.Completion.TrySetResult(
+            result);
     }
 
     /// <summary>
-    /// Останавливает worker и завершает оставшиеся
-    /// необработанные запросы отменой.
-    /// </summary>
-    /// <summary>
     /// Асинхронно останавливает worker.
     ///
-    /// Новые запросы после начала остановки больше не исполняются.
     /// Уже выполняющийся transport-запрос завершается по обычным
-    /// правилам cancellation/timeout.
-    ///
-    /// Метод не блокирует вызывающий поток синхронным ожиданием Task.
+    /// правилам cancellation/timeout. Оставшиеся очереди завершаются
+    /// детерминированным статусом Cancelled.
     /// </summary>
     public async Task StopAsync()
     {
@@ -423,7 +413,9 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // Штатное завершение worker.
+                // Защитный catch для lifecycle worker.
+                // Пользовательские transport-запросы при этом
+                // завершаются через ModbusTransportStatus.Cancelled.
             }
         }
 
@@ -436,32 +428,56 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     }
 
     /// <summary>
-    /// Завершает все запросы, которые остались в очередях
-    /// после остановки диспетчера.
+    /// Завершает все запросы, оставшиеся в очередях после остановки.
+    ///
+    /// Отмена lifecycle является штатным transport-состоянием,
+    /// поэтому Task не переводятся в Canceled/Exception.
     /// </summary>
-    private void CancelPendingRequests(
-        CancellationToken cancellationToken)
+    private void CompletePendingRequestsAsCancelled()
     {
         while (_writeRequests.TryDequeue(
                    out WriteRequest? writeRequest))
         {
-            writeRequest.Completion.TrySetCanceled(
-                cancellationToken);
+            writeRequest.Completion.TrySetResult(
+                CreateCancelledWriteResult());
         }
 
         while (_pollRequests.TryDequeue(
                    out ReadRequest? pollRequest))
         {
-            pollRequest.Completion.TrySetCanceled(
-                cancellationToken);
+            pollRequest.Completion.TrySetResult(
+                CreateCancelledReadResult());
         }
 
         while (_singleReadRequests.TryDequeue(
                    out ReadRequest? singleReadRequest))
         {
-            singleReadRequest.Completion.TrySetCanceled(
-                cancellationToken);
+            singleReadRequest.Completion.TrySetResult(
+                CreateCancelledReadResult());
         }
+    }
+
+    /// <summary>
+    /// Создаёт результат штатной отмены операции чтения.
+    /// </summary>
+    private static ModbusReadResult CreateCancelledReadResult()
+    {
+        return new ModbusReadResult
+        {
+            Status = ModbusTransportStatus.Cancelled,
+            Data = null
+        };
+    }
+
+    /// <summary>
+    /// Создаёт результат штатной отмены операции записи.
+    /// </summary>
+    private static ModbusWriteResult CreateCancelledWriteResult()
+    {
+        return new ModbusWriteResult
+        {
+            Status = ModbusTransportStatus.Cancelled
+        };
     }
 
     /// <summary>
@@ -475,10 +491,6 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
             TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
-    /// <summary>
-    /// Останавливает диспетчер и освобождает принадлежащий ему
-    /// примитив сигнализации.
-    /// </summary>
     /// <summary>
     /// Асинхронно завершает dispatcher и освобождает
     /// принадлежащий ему примитив сигнализации.
@@ -497,7 +509,7 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         byte SlaveId,
         ushort StartAddress,
         ushort Count,
-        TaskCompletionSource<ushort[]> Completion);
+        TaskCompletionSource<ModbusReadResult> Completion);
 
     /// <summary>
     /// Внутреннее представление команды записи.
@@ -510,13 +522,13 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         ushort Address,
         ushort Value,
         ushort[]? Values,
-        TaskCompletionSource<bool> Completion)
+        TaskCompletionSource<ModbusWriteResult> Completion)
     {
         public static WriteRequest CreateSingle(
             byte slaveId,
             ushort address,
             ushort value,
-            TaskCompletionSource<bool> completion)
+            TaskCompletionSource<ModbusWriteResult> completion)
         {
             return new WriteRequest(
                 slaveId,
@@ -530,7 +542,7 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
             byte slaveId,
             ushort startAddress,
             ushort[] values,
-            TaskCompletionSource<bool> completion)
+            TaskCompletionSource<ModbusWriteResult> completion)
         {
             return new WriteRequest(
                 slaveId,

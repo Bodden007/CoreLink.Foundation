@@ -1,5 +1,6 @@
 using CoreLink.Transport.Modbus.Configuration;
 using CoreLink.Transport.Modbus.Dispatching;
+using CoreLink.Transport.Modbus.Results;
 
 namespace CoreLink.Transport.Modbus.Polling;
 
@@ -29,12 +30,13 @@ internal sealed class ModbusPoller : IAsyncDisposable
     public event Action<ushort[]>? RegistersReceived;
 
     /// <summary>
-    /// Вызывается при ошибке очередного polling-запроса.
+    /// Публикует неуспешный результат polling-запроса.
     ///
     /// Ошибка одного запроса не останавливает постоянный polling.
-    /// После штатной задержки будет выполнена следующая попытка.
+    /// Следующий цикл снова передаст запрос Transport,
+    /// который при необходимости самостоятельно выполнит reconnect.
     /// </summary>
-    public event Action<Exception>? PollingError;
+    public event Action<ModbusTransportStatus>? PollingStatusChanged;
 
     /// <summary>
     /// Показывает, запущен ли основной цикл polling.
@@ -85,8 +87,8 @@ internal sealed class ModbusPoller : IAsyncDisposable
     /// Поэтому очередь polling не может накапливаться,
     /// даже если PLC отвечает медленнее заданного интервала.
     ///
-    /// Ошибка одного запроса публикуется через PollingError,
-    /// но не завершает основной цикл.
+    /// Неуспешный запрос публикуется как ModbusTransportStatus
+    /// и не завершает основной цикл.
     /// </summary>
     private async Task PollAsync(
         CancellationToken cancellationToken)
@@ -95,31 +97,39 @@ internal sealed class ModbusPoller : IAsyncDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                try
-                {
-                    ushort[] registers =
-                        await _dispatcher.ReadPollingAsync(
-                            _config.SlaveId,
-                            _config.InputStartAddress,
-                            _config.InputRegisterCount);
+                ModbusReadResult result =
+                    await _dispatcher.ReadPollingAsync(
+                        _config.SlaveId,
+                        _config.InputStartAddress,
+                        _config.InputRegisterCount);
 
-                    if (registers.Length > 0)
+                if (result.Status ==
+                    ModbusTransportStatus.Cancelled)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                        break;
+                }
+                else if (result.Ok)
+                {
+                    ushort[]? registers =
+                        result.Data;
+
+                    if (registers is not null &&
+                        registers.Length > 0)
                     {
                         RegistersReceived?.Invoke(
                             registers);
                     }
                 }
-                catch (OperationCanceledException)
-                    when (cancellationToken.IsCancellationRequested)
+                else
                 {
-                    break;
-                }
-                catch (Exception exception)
-                {
-                    // Потеря связи или ошибка одного Modbus-запроса
-                    // не должна останавливать постоянный polling.
-                    PollingError?.Invoke(
-                        exception);
+                    // Потеря связи или ошибка Modbus-запроса
+                    // является обычным состоянием Transport.
+                    //
+                    // Poller не выполняет reconnect самостоятельно:
+                    // следующий запрос снова проходит через Transport.
+                    PollingStatusChanged?.Invoke(
+                        result.Status);
                 }
 
                 await Task.Delay(
@@ -130,16 +140,10 @@ internal sealed class ModbusPoller : IAsyncDisposable
         catch (OperationCanceledException)
             when (cancellationToken.IsCancellationRequested)
         {
-            // Штатное завершение polling.
+            // Штатное завершение polling lifecycle.
         }
     }
 
-    /// <summary>
-    /// Останавливает создание новых polling-запросов.
-    ///
-    /// Уже переданный диспетчеру Modbus-запрос не прерывается:
-    /// он завершается по обычным правилам transport слоя.
-    /// </summary>
     /// <summary>
     /// Асинхронно останавливает создание новых polling-запросов.
     ///
@@ -168,7 +172,7 @@ internal sealed class ModbusPoller : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // Штатное завершение polling.
+                // Защитный catch lifecycle.
             }
         }
 
@@ -178,12 +182,6 @@ internal sealed class ModbusPoller : IAsyncDisposable
         _pollingTask = null;
     }
 
-    /// <summary>
-    /// Останавливает polling.
-    ///
-    /// Диспетчер здесь не уничтожается, поскольку его lifetime
-    /// принадлежит владельцу всей Modbus-сессии.
-    /// </summary>
     /// <summary>
     /// Асинхронно завершает polling.
     ///
