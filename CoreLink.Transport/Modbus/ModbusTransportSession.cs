@@ -1,4 +1,4 @@
-    using CoreLink.Transport.Modbus.Configuration;
+using CoreLink.Transport.Modbus.Configuration;
 using CoreLink.Transport.Modbus.Connection;
 using CoreLink.Transport.Modbus.Dispatching;
 using CoreLink.Transport.Modbus.Polling;
@@ -32,6 +32,14 @@ public sealed class ModbusTransportSession : IDisposable
     public event Action<ushort[]>? RegistersReceived;
 
     /// <summary>
+    /// Вызывается при ошибке штатного polling.
+    ///
+    /// Ошибка не означает остановку transport-сессии:
+    /// poller продолжает выполнять следующие попытки.
+    /// </summary>
+    public event Action<Exception>? TransportError;
+
+    /// <summary>
     /// Показывает, запущен ли постоянный polling.
     /// </summary>
     public bool IsRunning => _poller.IsRunning;
@@ -46,8 +54,9 @@ public sealed class ModbusTransportSession : IDisposable
     public ModbusTransportSession(
         ModbusConnectionConfig config)
     {
-        _config = config;
         ArgumentNullException.ThrowIfNull(config);
+
+        _config = config;
 
         _connectionManager =
             new ModbusConnectionManager(config);
@@ -63,6 +72,9 @@ public sealed class ModbusTransportSession : IDisposable
 
         _poller.RegistersReceived +=
             OnRegistersReceived;
+
+        _poller.PollingError +=
+OnPollingError;
     }
 
     /// <summary>
@@ -161,6 +173,16 @@ public sealed class ModbusTransportSession : IDisposable
     }
 
     /// <summary>
+    /// Передаёт ошибку polling владельцу transport-сессии.
+    /// </summary>
+    private void OnPollingError(
+        Exception exception)
+    {
+        TransportError?.Invoke(
+            exception);
+    }
+
+    /// <summary>
     /// Проверяет, что сессия может принимать новые операции.
     /// </summary>
     private void ThrowIfNotAvailable()
@@ -199,6 +221,9 @@ public sealed class ModbusTransportSession : IDisposable
 
         _poller.RegistersReceived -=
             OnRegistersReceived;
+
+        _poller.PollingError -=
+            OnPollingError;
 
         _poller.Dispose();
         _dispatcher.Dispose();

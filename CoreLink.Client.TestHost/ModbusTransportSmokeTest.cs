@@ -54,6 +54,15 @@ internal static class ModbusTransportSmokeTest
                 $"[{string.Join(", ", registers)}]");
         };
 
+        transport.TransportError += exception =>
+        {
+            Console.WriteLine(
+                $"POLL ERROR   " +
+                $"{DateTime.Now:HH:mm:ss.fff} " +
+                $"{exception.GetType().Name}: " +
+                $"{exception.Message}");
+        };
+
         Console.WriteLine();
         Console.WriteLine("=== MODBUS TRANSPORT SMOKE TEST ===");
         Console.WriteLine(
@@ -133,13 +142,24 @@ internal static class ModbusTransportSmokeTest
             $"{started:HH:mm:ss.fff} " +
             $"address={address} value={value}");
 
-        await transport.WriteSingleRegisterAsync(
-            address,
-            value);
+        try
+        {
+            await transport.WriteSingleRegisterAsync(
+                address,
+                value);
 
-        Console.WriteLine(
-            $"WRITE DONE   " +
-            $"{DateTime.Now:HH:mm:ss.fff}");
+            Console.WriteLine(
+                $"WRITE DONE   " +
+                $"{DateTime.Now:HH:mm:ss.fff}");
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine(
+                $"WRITE FAILED " +
+                $"{DateTime.Now:HH:mm:ss.fff} " +
+                $"{exception.GetType().Name}: " +
+                $"{exception.Message}");
+        }
     }
 
     /// <summary>
@@ -149,7 +169,7 @@ internal static class ModbusTransportSmokeTest
     /// но имеет меньший приоритет, чем штатный polling.
     /// </summary>
     private static async Task ExecuteSingleReadAsync(
-        ModbusTransportSession transport)
+    ModbusTransportSession transport)
     {
         const ushort startAddress = 8;
         const ushort count = 2;
@@ -162,14 +182,25 @@ internal static class ModbusTransportSmokeTest
             $"{started:HH:mm:ss.fff} " +
             $"start={startAddress} count={count}");
 
-        ushort[] registers =
-            await transport.ReadSingleAsync(
-                startAddress,
-                count);
+        try
+        {
+            ushort[] registers =
+                await transport.ReadSingleAsync(
+                    startAddress,
+                    count);
 
-        Console.WriteLine(
-            $"SINGLE DONE   " +
-            $"{DateTime.Now:HH:mm:ss.fff} " +
-            $"[{string.Join(", ", registers)}]");
+            Console.WriteLine(
+                $"SINGLE DONE   " +
+                $"{DateTime.Now:HH:mm:ss.fff} " +
+                $"[{string.Join(", ", registers)}]");
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine(
+                $"SINGLE FAILED " +
+                $"{DateTime.Now:HH:mm:ss.fff} " +
+                $"{exception.GetType().Name}: " +
+                $"{exception.Message}");
+        }
     }
 }

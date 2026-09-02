@@ -29,6 +29,14 @@ internal sealed class ModbusPoller : IDisposable
     public event Action<ushort[]>? RegistersReceived;
 
     /// <summary>
+    /// Вызывается при ошибке очередного polling-запроса.
+    ///
+    /// Ошибка одного запроса не останавливает постоянный polling.
+    /// После штатной задержки будет выполнена следующая попытка.
+    /// </summary>
+    public event Action<Exception>? PollingError;
+
+    /// <summary>
     /// Показывает, запущен ли основной цикл polling.
     /// </summary>
     public bool IsRunning =>
@@ -60,10 +68,12 @@ internal sealed class ModbusPoller : IDisposable
         if (IsRunning)
             return;
 
-        _pollingCts = new CancellationTokenSource();
+        _pollingCts =
+            new CancellationTokenSource();
 
-        _pollingTask = PollAsync(
-            _pollingCts.Token);
+        _pollingTask =
+            PollAsync(
+                _pollingCts.Token);
     }
 
     /// <summary>
@@ -74,6 +84,9 @@ internal sealed class ModbusPoller : IDisposable
     ///
     /// Поэтому очередь polling не может накапливаться,
     /// даже если PLC отвечает медленнее заданного интервала.
+    ///
+    /// Ошибка одного запроса публикуется через PollingError,
+    /// но не завершает основной цикл.
     /// </summary>
     private async Task PollAsync(
         CancellationToken cancellationToken)
@@ -82,16 +95,31 @@ internal sealed class ModbusPoller : IDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                ushort[] registers =
-                    await _dispatcher.ReadPollingAsync(
-                        _config.SlaveId,
-                        _config.InputStartAddress,
-                        _config.InputRegisterCount);
-
-                if (registers.Length > 0)
+                try
                 {
-                    RegistersReceived?.Invoke(
-                        registers);
+                    ushort[] registers =
+                        await _dispatcher.ReadPollingAsync(
+                            _config.SlaveId,
+                            _config.InputStartAddress,
+                            _config.InputRegisterCount);
+
+                    if (registers.Length > 0)
+                    {
+                        RegistersReceived?.Invoke(
+                            registers);
+                    }
+                }
+                catch (OperationCanceledException)
+                    when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    // Потеря связи или ошибка одного Modbus-запроса
+                    // не должна останавливать постоянный polling.
+                    PollingError?.Invoke(
+                        exception);
                 }
 
                 await Task.Delay(
