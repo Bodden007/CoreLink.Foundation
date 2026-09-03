@@ -1,30 +1,51 @@
-using CoreLink.Maps.Models;
+using CoreLink.Contracts.Registers;
+using CoreLink.Maps.Definitions;
 
 namespace CoreLink.Maps.Maps;
 
-/// <summary>
-/// Временная карта для разработки CoreLink.Client.
-/// </summary>
 internal static class TestMap
 {
-    public static CoreLinkMap Create()
+    public static PhysicalMap Create()
     {
-        return new CoreLinkMap
+        return new PhysicalMap
         {
             IpAddress = "192.168.0.10",
             Port = 502,
-            StartAddress = 100,
+            PollIntervalMs = 500,
+            RegisterOrder = RegisterOrder.ABCD,
 
-            TypeMap =
+            Registers =
             [
-                2,
-                1,
-                2,
-                2,
-                1
-            ],
+                new PhysicalRegister(
+                    "Pressure_1",
+                    8,
+                    RegisterType.Float),
 
-            PollIntervalMs = 500
+                new PhysicalRegister(
+                    "Opko_1",
+                    12,
+                    RegisterType.Float),
+
+                new PhysicalRegister(
+                    "StatOpko_1",
+                    14,
+                    RegisterType.Word),
+
+                new PhysicalRegister(
+                    "TempOutlet",
+                    20,
+                    RegisterType.Float),
+
+                new PhysicalRegister(
+                    "Vaporizer",
+                    22,
+                    RegisterType.Float),
+
+                new PhysicalRegister(
+                    "Bath",
+                    24,
+                    RegisterType.Float)
+            ]
         };
     }
 }

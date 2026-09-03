@@ -1,9 +1,6 @@
-using CoreLink.Client.Buffers;
-using CoreLink.Client.Interop;
 using CoreLink.Client.Lifecycle;
 using CoreLink.Client.Results;
-using CoreLink.Maps;
-using CoreLink.Maps.Models;
+using CoreLink.Contracts.Maps;
 
 namespace CoreLink.Client;
 
@@ -12,9 +9,17 @@ namespace CoreLink.Client;
 /// </summary>
 public sealed class CoreLinkClient
 {
-    private CoreLinkMap? _map;
+    private readonly IMapProvider _mapProvider;
 
-    public CoreLinkState State { get; private set; } = CoreLinkState.Created;
+    private MapConfiguration? _configuration;
+
+    public CoreLinkState State { get; private set; } =
+        CoreLinkState.Created;
+
+    public CoreLinkClient(IMapProvider mapProvider)
+    {
+        _mapProvider = mapProvider;
+    }
 
     public CoreLinkResult Start(string mapId)
     {
@@ -25,22 +30,18 @@ public sealed class CoreLinkClient
 
         State = CoreLinkState.Starting;
 
-        if (!MapManager.TryLoad(mapId, out _map))
+        if (!_mapProvider.TryLoad(
+                mapId,
+                out _configuration))
         {
             State = CoreLinkState.Faulted;
+
             return CoreLinkResult.BadConfig;
         }
 
         State = CoreLinkState.Running;
 
         return CoreLinkResult.Ok;
-    }
-
-    // FIXME: Временный публичный доступ к бинарному конфигурационному буферу.
-    // Удалить после завершения проверки Configure через FFI.
-    public CoreLinkResult BuildConfigBuffer(out byte[]? buffer)
-    {
-        return ConfigBufferBuilder.TryBuild(_map, out buffer);
     }
 
     public void Stop()
@@ -52,75 +53,8 @@ public sealed class CoreLinkClient
 
         State = CoreLinkState.Stopping;
 
-        _map = null;
+        _configuration = null;
 
         State = CoreLinkState.Stopped;
-    }
-
-    public CoreLinkResult Configure()
-    {
-        var buildResult = ConfigBufferBuilder.TryBuild(
-            _map,
-            out var buffer);
-
-        if (buildResult != CoreLinkResult.Ok ||
-            buffer is null)
-        {
-            return buildResult;
-        }
-
-        using var pinned = new PinnedConfigBuffer(buffer);
-
-        var nativeResult = NativeMethods.Configure(
-    pinned.Pointer);
-
-        return (CoreLinkResult)nativeResult;
-    }
-
-    // FIXME: Временный метод для проверки pinning конфигурационного буфера.
-    // Удалить после завершения FFI-тестов.
-    public CoreLinkResult TestConfigPin(
-        out nint pointer,
-        out int length)
-    {
-        pointer = 0;
-        length = 0;
-
-        var result = ConfigBufferBuilder.TryBuild(
-            _map,
-            out var buffer);
-
-        if (result != CoreLinkResult.Ok ||
-            buffer is null)
-        {
-            return result;
-        }
-
-        using var pinned = new PinnedConfigBuffer(buffer);
-
-        pointer = pinned.Pointer;
-        length = pinned.Length;
-
-        return CoreLinkResult.Ok;
-    }
-
-    // FIXME: Временный метод для проверки вызова CoreLink.Client -> Rust.
-    // Удалить после появления штатного Configure без тестового кода.
-    public int TestConfigure()
-    {
-        var buildResult = ConfigBufferBuilder.TryBuild(
-            _map,
-            out var buffer);
-
-        if (buildResult != CoreLinkResult.Ok ||
-            buffer is null)
-        {
-            return -1;
-        }
-
-        using var pinned = new PinnedConfigBuffer(buffer);
-
-        return NativeMethods.Configure(
-       pinned.Pointer);
     }
 }

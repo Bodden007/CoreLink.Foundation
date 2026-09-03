@@ -3,6 +3,8 @@
   <ItemGroup>
     <ProjectReference Include="..\CoreLink.Client\CoreLink.Client.csproj" />
     <ProjectReference Include="..\CoreLink.Transport\CoreLink.Transport.csproj" />
+    <ProjectReference Include="..\CoreLink.Contracts\CoreLink.Contracts.csproj" />
+    <ProjectReference Include="..\CoreLink.Maps\CoreLink.Maps.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
