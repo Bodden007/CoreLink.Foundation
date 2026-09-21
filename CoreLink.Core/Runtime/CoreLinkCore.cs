@@ -28,7 +28,4 @@ public sealed class CoreLinkCore : ICore
         return CoreStatus.Stopped;
     }
 
-    public void BufferReleased()
-    {
-    }
 }

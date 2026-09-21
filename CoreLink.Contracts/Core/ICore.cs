@@ -10,8 +10,6 @@ public interface ICore
 
     CoreStatus Stop();
 
-    void BufferReleased();
-
     event Action? BufferReady;
 
     event Action<CoreStatus>? StatusChanged;

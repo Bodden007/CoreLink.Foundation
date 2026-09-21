@@ -60,6 +60,42 @@ public sealed class CoreLinkClient
                 _coreMap,
                 _coreBuffer);
 
+        var result =
+            coreStatus switch
+            {
+                CoreStatus.Running =>
+                    CoreLinkResult.Ok,
+
+                CoreStatus.Disconnected =>
+                    CoreLinkResult.Disconnected,
+
+                CoreStatus.BadConfig =>
+                    CoreLinkResult.BadConfig,
+
+                CoreStatus.Error =>
+                    CoreLinkResult.SessionError,
+
+                CoreStatus.Stopped =>
+                    CoreLinkResult.SessionError,
+
+                CoreStatus.Reconnecting =>
+                    CoreLinkResult.SessionError,
+
+                _ =>
+                    CoreLinkResult.SessionError
+            };
+
+        if (result != CoreLinkResult.Ok)
+        {
+            _coreBuffer = null;
+            _coreMap = null;
+
+            State =
+                CoreLinkState.Faulted;
+
+            return result;
+        }
+
         State =
             CoreLinkState.Running;
 
@@ -77,6 +113,8 @@ public sealed class CoreLinkClient
 
         State =
             CoreLinkState.Stopping;
+
+        _core.Stop();
 
         _coreBuffer = null;
         _coreMap = null;
