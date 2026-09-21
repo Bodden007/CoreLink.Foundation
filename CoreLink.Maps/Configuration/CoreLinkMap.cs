@@ -1,19 +1,19 @@
-using CoreLink.Maps.Registers;
+using CoreLink.Contracts.Registers;
+using CoreLink.Maps.Definitions;
 
 namespace CoreLink.Maps.Configuration;
 
-/// <summary>
-/// Содержит параметры источника данных и физическую карту значений CoreLink.
-/// </summary>
-public sealed class CoreLinkMap
+internal sealed class CoreLinkMap
 {
     public required string IpAddress { get; init; }
 
     public ushort Port { get; init; }
 
+    public byte UnitId { get; init; }
+
     public int PollIntervalMs { get; init; }
 
     public RegisterOrder RegisterOrder { get; init; }
 
-    public required RegisterMapEntry[] Registers { get; init; }
+    public required PhysicalRegister[] Registers { get; init; }
 }

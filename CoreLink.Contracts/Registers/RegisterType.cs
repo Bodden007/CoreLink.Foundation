@@ -1,7 +1,7 @@
 namespace CoreLink.Contracts.Registers;
 
-public enum RegisterType
+public enum RegisterType : byte
 {
-    Word,
-    Float
+    Word = 0,
+    Float = 1
 }
