@@ -22,18 +22,25 @@ internal static class ModbusTransportSmokeTest
     /// </summary>
     public static async Task RunAsync()
     {
+        // Отдельная локальная конфигурация намеренно хранится прямо в smoke test:
+        // здесь проверяется фактический runtime-path транспорта, а не загрузка карты.
         ModbusConnectionConfig config = new()
         {
             Host = "127.0.0.1",
             Port = 1502,
             SlaveId = 255,
 
+            // Таймауты оставлены короткими, чтобы ручная проверка быстро показывала
+            // отсутствие PLC/эмулятора и не создавала впечатление зависшего процесса.
             ConnectTimeoutMs = 3000,
             RequestTimeoutMs = 1000,
             ReconnectDelayMs = 1000,
 
+            // 500 ms соответствует текущему базовому циклу polling проекта.
             PollIntervalMs = 500,
 
+            // Читаем минимальный диапазон: для smoke test важнее жизненный цикл
+            // сессии и диспетчеризация запросов, чем полнота технологической карты.
             InputStartAddress = 8,
             InputRegisterCount = 2
         };
@@ -41,6 +48,8 @@ internal static class ModbusTransportSmokeTest
         await using ModbusTransportSession transport =
             new(config);
 
+        // Счетчик нужен не для логики транспорта, а для визуальной проверки:
+        // polling продолжает работать до и после ручных read/write команд.
         long pollCount = 0;
 
         transport.RegistersReceived += registers =>
@@ -55,6 +64,8 @@ internal static class ModbusTransportSmokeTest
                 $"[{string.Join(", ", registers)}]");
         };
 
+        // Статус выводится отдельно от данных, чтобы при обрыве связи было видно:
+        // прекратились ли кадры из-за PLC или из-за остановки самого теста.
         transport.TransportStatusChanged += status =>
         {
             Console.WriteLine(
@@ -74,6 +85,8 @@ internal static class ModbusTransportSmokeTest
             $"count={config.InputRegisterCount}, " +
             $"interval={config.PollIntervalMs} ms");
 
+        // Start вызывается до чтения клавиатуры: ручные команды должны попадать
+        // в уже работающую сессию и конкурировать именно со штатным polling.
         transport.Start();
 
         Console.WriteLine();
@@ -89,6 +102,8 @@ internal static class ModbusTransportSmokeTest
 
         while (running)
         {
+            // Управление намеренно синхронное с консоли: так легче воспроизводить
+            // последовательность действий при диагностике приоритетов dispatcher.
             ConsoleKeyInfo key =
                 Console.ReadKey(
                     intercept: true);
@@ -111,6 +126,7 @@ internal static class ModbusTransportSmokeTest
             }
         }
 
+        // Явно проверяем штатный Stop, хотя await using дополнительно страхует Dispose.
         await transport.StopAsync();
 
         Console.WriteLine();
@@ -134,6 +150,8 @@ internal static class ModbusTransportSmokeTest
         const ushort address = 2;
         const ushort value = 1;
 
+        // Время постановки команды позволяет глазами оценить задержку write
+        // относительно фонового polling без отдельного профилировщика.
         DateTime started =
             DateTime.Now;
 
@@ -142,6 +160,8 @@ internal static class ModbusTransportSmokeTest
             $"{started:HH:mm:ss.fff} " +
             $"address={address} value={value}");
 
+        // Важна именно запись через публичную сессию, а не прямой вызов manager:
+        // smoke test должен проходить тот же путь, что и будущий Client.
         ModbusWriteResult result =
             await transport.WriteSingleRegisterAsync(
                 address,
@@ -174,6 +194,8 @@ internal static class ModbusTransportSmokeTest
         const ushort startAddress = 8;
         const ushort count = 2;
 
+        // Метка времени нужна для ручной проверки: single read не должен
+        // нарушать последовательность polling и не должен зависать бесконечно.
         DateTime started =
             DateTime.Now;
 
@@ -182,6 +204,8 @@ internal static class ModbusTransportSmokeTest
             $"{started:HH:mm:ss.fff} " +
             $"start={startAddress} count={count}");
 
+        // Запрос выполняется через ту же transport session, чтобы проверить
+        // реальную arbitration policy dispatcher, а не isolated read API.
         ModbusReadResult result =
             await transport.ReadSingleAsync(
                 startAddress,
