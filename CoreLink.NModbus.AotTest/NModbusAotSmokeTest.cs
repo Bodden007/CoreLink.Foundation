@@ -7,6 +7,8 @@ internal sealed class NModbusAotSmokeTest : IDisposable
     private readonly string _host;
     private readonly int _port;
 
+    // TcpClient и IModbusMaster хранятся вместе: smoke test проверяет
+    // их общий lifetime как одной физической Modbus/TCP сессии.
     private TcpClient? _tcpClient;
     private IModbusMaster? _master;
 
@@ -30,12 +32,16 @@ internal sealed class NModbusAotSmokeTest : IDisposable
         int timeoutMs,
         CancellationToken cancellationToken = default)
     {
+        // Повторный вызов ConnectAsync должен начинаться с чистого состояния:
+        // stale master от предыдущей попытки не должен участвовать в проверке.
         DisposeConnection();
 
         try
         {
             TcpClient tcpClient = new();
 
+            // Linked CTS одновременно уважает внешний cancellation
+            // и принудительно ограничивает длительность smoke-проверки.
             using CancellationTokenSource timeoutCts =
                 CancellationTokenSource.CreateLinkedTokenSource(
                     cancellationToken);
@@ -47,6 +53,8 @@ internal sealed class NModbusAotSmokeTest : IDisposable
                 _port,
                 timeoutCts.Token);
 
+            // Важен реальный CreateMaster: наличие только compile-time reference
+            // недостаточно для подтверждения reachable NativeAOT path.
             ModbusFactory factory = new();
 
             _tcpClient = tcpClient;
@@ -56,11 +64,15 @@ internal sealed class NModbusAotSmokeTest : IDisposable
         }
         catch (OperationCanceledException)
         {
+            // Timeout/cancel для этого теста трактуется как штатный отрицательный
+            // результат проверки доступности, а не как падение executable.
             DisposeConnection();
             return false;
         }
         catch (SocketException)
         {
+            // Connection refused / network unavailable также должны завершать
+            // smoke test предсказуемо и освобождать частично созданную сессию.
             DisposeConnection();
             return false;
         }
@@ -77,6 +89,8 @@ internal sealed class NModbusAotSmokeTest : IDisposable
         ushort startAddress,
         ushort count)
     {
+        // Пустой массив здесь означает "операция не выполнялась":
+        // smoke test не вводит отдельный result contract, чтобы не тестировать сам себя.
         if (_master is null)
             return Array.Empty<ushort>();
 
@@ -91,6 +105,9 @@ internal sealed class NModbusAotSmokeTest : IDisposable
         {
             // FIXME: общий catch нужен только для AOT smoke test.
             // Удалить после завершения проверки NModbus.
+            //
+            // Любая ошибка I/O инвалидирует текущую тестовую сессию:
+            // последующие операции должны начинаться только после нового ConnectAsync.
             DisposeConnection();
 
             return Array.Empty<ushort>();
@@ -113,6 +130,8 @@ internal sealed class NModbusAotSmokeTest : IDisposable
 
         try
         {
+            // Само значение для AOT-проверки вторично: цель — заставить runtime
+            // пройти реальный generic-free путь NModbus до FC06.
             await _master.WriteSingleRegisterAsync(
                 slaveId,
                 address,
@@ -146,6 +165,8 @@ internal sealed class NModbusAotSmokeTest : IDisposable
 
         try
         {
+            // FC16 проверяется отдельно от FC06: NativeAOT должен сохранить
+            // оба реально используемых API, даже если transport пока вызывает их редко.
             await _master.WriteMultipleRegistersAsync(
                 slaveId,
                 startAddress,
@@ -177,6 +198,8 @@ internal sealed class NModbusAotSmokeTest : IDisposable
         ushort lowWord,
         ushort highWord)
     {
+        // Этот вызов входит в smoke test не ради арифметики как таковой:
+        // он фиксирует используемый production API NModbus.Utility для NativeAOT.
         return ModbusUtility.GetSingle(
             highWord,
             lowWord);
@@ -184,6 +207,8 @@ internal sealed class NModbusAotSmokeTest : IDisposable
 
     private void DisposeConnection()
     {
+        // Сначала уничтожается master, затем TCP socket — тот же порядок нужен
+        // будущему transport при признании текущей сессии поврежденной.
         _master?.Dispose();
         _master = null;
 
@@ -193,6 +218,8 @@ internal sealed class NModbusAotSmokeTest : IDisposable
 
     public void Dispose()
     {
+        // Идемпотентный cleanup позволяет безопасно использовать обычный using
+        // независимо от того, завершился тест успешно или оборвался на I/O.
         DisposeConnection();
     }
 }
