@@ -1,3 +1,4 @@
+
 using System.Buffers.Binary;
 using System.Net;
 using CoreLink.Contracts.Maps;
@@ -73,6 +74,21 @@ internal static class CoreMapEncoder
         BinaryPrimitives.WriteInt32LittleEndian(
             span.Slice(offset, 4),
             map.PollIntervalMs);
+        offset += 4;
+
+        BinaryPrimitives.WriteInt32LittleEndian(
+            span.Slice(offset, 4),
+            map.ConnectTimeoutMs);
+        offset += 4;
+
+        BinaryPrimitives.WriteInt32LittleEndian(
+            span.Slice(offset, 4),
+            map.RequestTimeoutMs);
+        offset += 4;
+
+        BinaryPrimitives.WriteInt32LittleEndian(
+            span.Slice(offset, 4),
+            map.ReconnectDelayMs);
         offset += 4;
 
         BinaryPrimitives.WriteUInt16LittleEndian(

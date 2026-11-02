@@ -1,3 +1,4 @@
+
 using CoreLink.Transport.Configuration.Types;
 
 namespace CoreLink.Transport.Configuration.Models;
@@ -11,6 +12,12 @@ internal sealed class TransportMap
     public required byte UnitId { get; init; }
 
     public required int PollIntervalMs { get; init; }
+
+    public required int ConnectTimeoutMs { get; init; }
+
+    public required int RequestTimeoutMs { get; init; }
+
+    public required int ReconnectDelayMs { get; init; }
 
     public required ushort StartAddress { get; init; }
 

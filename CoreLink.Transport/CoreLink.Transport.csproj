@@ -11,6 +11,10 @@
     <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
+    <ItemGroup>
+    <ProjectReference Include="..\CoreLink.Contracts\CoreLink.Contracts.csproj" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="NModbus" Version="3.0.83" />
   </ItemGroup>

@@ -1,3 +1,4 @@
+
 using CoreLink.Contracts.Registers;
 using CoreLink.Maps.Definitions;
 
@@ -12,6 +13,12 @@ internal sealed class CoreLinkMap
     public byte UnitId { get; init; }
 
     public int PollIntervalMs { get; init; }
+
+    public int ConnectTimeoutMs { get; init; }
+
+    public int RequestTimeoutMs { get; init; }
+
+    public int ReconnectDelayMs { get; init; }
 
     public RegisterOrder RegisterOrder { get; init; }
 

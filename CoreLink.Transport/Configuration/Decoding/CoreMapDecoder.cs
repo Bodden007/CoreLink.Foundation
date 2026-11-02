@@ -1,5 +1,7 @@
+
 using System.Buffers.Binary;
 using System.Net;
+using CoreLink.Contracts.Maps;
 using CoreLink.Transport.Configuration.Models;
 using CoreLink.Transport.Configuration.Types;
 
@@ -7,16 +9,10 @@ namespace CoreLink.Transport.Configuration.Decoding;
 
 internal static class CoreMapDecoder
 {
-    private const byte SupportedVersion = 1;
-
-    private const int HeaderSize = 21;
-
-    private const int ValueSize = 3;
-
     public static TransportMap Decode(
         ReadOnlySpan<byte> buffer)
     {
-        if (buffer.Length < HeaderSize)
+        if (buffer.Length < CoreMapLayout.HeaderSize)
         {
             throw new InvalidOperationException(
                 "Core map buffer is too short.");
@@ -27,7 +23,7 @@ internal static class CoreMapDecoder
         var version =
             buffer[offset++];
 
-        if (version != SupportedVersion)
+        if (version != CoreMapLayout.Version)
         {
             throw new InvalidOperationException(
                 $"Unsupported core map version: {version}.");
@@ -63,6 +59,21 @@ internal static class CoreMapDecoder
                 buffer.Slice(offset, 4));
         offset += 4;
 
+        var connectTimeoutMs =
+            BinaryPrimitives.ReadInt32LittleEndian(
+                buffer.Slice(offset, 4));
+        offset += 4;
+
+        var requestTimeoutMs =
+            BinaryPrimitives.ReadInt32LittleEndian(
+                buffer.Slice(offset, 4));
+        offset += 4;
+
+        var reconnectDelayMs =
+            BinaryPrimitives.ReadInt32LittleEndian(
+                buffer.Slice(offset, 4));
+        offset += 4;
+
         var startAddress =
             BinaryPrimitives.ReadUInt16LittleEndian(
                 buffer.Slice(offset, 2));
@@ -92,8 +103,8 @@ internal static class CoreMapDecoder
         offset += 2;
 
         var expectedLength =
-            HeaderSize +
-            valueCount * ValueSize;
+            CoreMapLayout.HeaderSize +
+            valueCount * CoreMapLayout.ValueSize;
 
         if (expectedLength != buffer.Length)
         {
@@ -133,6 +144,9 @@ internal static class CoreMapDecoder
             Port = port,
             UnitId = unitId,
             PollIntervalMs = pollIntervalMs,
+            ConnectTimeoutMs = connectTimeoutMs,
+            RequestTimeoutMs = requestTimeoutMs,
+            ReconnectDelayMs = reconnectDelayMs,
             StartAddress = startAddress,
             RegisterLength = registerLength,
             RegisterOrder = registerOrder,
