@@ -1,3 +1,4 @@
+
 using CoreLink.Client.Lifecycle;
 using CoreLink.Client.Results;
 using CoreLink.Contracts.Core;
@@ -6,6 +7,12 @@ using CoreLink.Core.Runtime;
 
 namespace CoreLink.Client;
 
+/// <summary>
+/// Публичная точка управления CoreLink.
+///
+/// Client владеет конфигурацией сессии и клиентским буфером.
+/// Управляет жизненным циклом Core.
+/// </summary>
 public sealed class CoreLinkClient
 {
     private readonly IMapProvider _mapProvider;
@@ -55,10 +62,10 @@ public sealed class CoreLinkClient
         _coreBuffer =
             new float[_coreMap.BufferLength];
 
+        // Core получает только карту.
+        // Клиентский массив остаётся во владении Client.
         var coreStatus =
-            _core.Start(
-                _coreMap,
-                _coreBuffer);
+            _core.Start(_coreMap);
 
         var result =
             coreStatus switch
