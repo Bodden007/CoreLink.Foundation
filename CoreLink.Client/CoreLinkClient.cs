@@ -3,7 +3,6 @@ using CoreLink.Client.Lifecycle;
 using CoreLink.Client.Results;
 using CoreLink.Contracts.Core;
 using CoreLink.Contracts.Maps;
-using CoreLink.Core.Runtime;
 
 namespace CoreLink.Client;
 
@@ -11,7 +10,7 @@ namespace CoreLink.Client;
 /// Публичная точка управления CoreLink.
 ///
 /// Client владеет конфигурацией сессии и клиентским буфером.
-/// Управляет жизненным циклом Core.
+/// Управляет жизненным циклом предоставленного ICore.
 /// </summary>
 public sealed class CoreLinkClient
 {
@@ -29,14 +28,16 @@ public sealed class CoreLinkClient
 
     public CoreLinkClient(
         IMapProvider mapProvider,
-        CoreBackend backend)
+        ICore core)
     {
+        ArgumentNullException.ThrowIfNull(mapProvider);
+        ArgumentNullException.ThrowIfNull(core);
+
         _mapProvider = mapProvider;
-        _core = new CoreLinkCore(backend);
+        _core = core;
     }
 
-    public CoreLinkResult Start(
-        string mapId)
+    public CoreLinkResult Start(string mapId)
     {
         if (State is
             CoreLinkState.Starting or
@@ -45,67 +46,47 @@ public sealed class CoreLinkClient
             return CoreLinkResult.Ok;
         }
 
-        State =
-            CoreLinkState.Starting;
+        State = CoreLinkState.Starting;
 
         if (!_mapProvider.TryLoad(
                 mapId,
                 out _coreMap) ||
             _coreMap is null)
         {
-            State =
-                CoreLinkState.Faulted;
-
+            State = CoreLinkState.Faulted;
             return CoreLinkResult.BadConfig;
         }
 
         _coreBuffer =
             new float[_coreMap.BufferLength];
 
-        // Core получает только карту.
-        // Клиентский массив остаётся во владении Client.
         var coreStatus =
             _core.Start(_coreMap);
 
-        var result =
-            coreStatus switch
-            {
-                CoreStatus.Running =>
-                    CoreLinkResult.Ok,
+        var result = coreStatus switch
+        {
+            CoreStatus.Running =>
+                CoreLinkResult.Ok,
 
-                CoreStatus.Disconnected =>
-                    CoreLinkResult.Disconnected,
+            CoreStatus.Disconnected =>
+                CoreLinkResult.Disconnected,
 
-                CoreStatus.BadConfig =>
-                    CoreLinkResult.BadConfig,
+            CoreStatus.BadConfig =>
+                CoreLinkResult.BadConfig,
 
-                CoreStatus.Error =>
-                    CoreLinkResult.SessionError,
-
-                CoreStatus.Stopped =>
-                    CoreLinkResult.SessionError,
-
-                CoreStatus.Reconnecting =>
-                    CoreLinkResult.SessionError,
-
-                _ =>
-                    CoreLinkResult.SessionError
-            };
+            _ =>
+                CoreLinkResult.SessionError
+        };
 
         if (result != CoreLinkResult.Ok)
         {
             _coreBuffer = null;
             _coreMap = null;
-
-            State =
-                CoreLinkState.Faulted;
-
+            State = CoreLinkState.Faulted;
             return result;
         }
 
-        State =
-            CoreLinkState.Running;
-
+        State = CoreLinkState.Running;
         return CoreLinkResult.Ok;
     }
 
@@ -118,15 +99,13 @@ public sealed class CoreLinkClient
             return;
         }
 
-        State =
-            CoreLinkState.Stopping;
+        State = CoreLinkState.Stopping;
 
         _core.Stop();
 
         _coreBuffer = null;
         _coreMap = null;
 
-        State =
-            CoreLinkState.Stopped;
+        State = CoreLinkState.Stopped;
     }
 }

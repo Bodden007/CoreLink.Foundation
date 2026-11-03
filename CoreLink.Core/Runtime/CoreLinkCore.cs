@@ -5,24 +5,19 @@ using CoreLink.Contracts.Maps;
 namespace CoreLink.Core.Runtime;
 
 /// <summary>
-/// Реализация Core.
+/// C# реализация ядра CoreLink.
 ///
-/// Управляет polling и хранением согласованных данных.
-/// Интеграция с Transport выполняется отдельным этапом.
+/// Управляет polling, взаимодействием с Transport
+/// и хранением согласованного snapshot.
+///
+/// Не зависит от Client и адаптеров.
 /// </summary>
-public sealed unsafe class CoreLinkCore : ICore
+public sealed unsafe class CoreLinkCore
 {
-    private readonly CoreBackend _backend;
-
-    public CoreLinkCore(CoreBackend backend)
-    {
-        _backend = backend;
-    }
-
     public event Action<CoreStatus>? StatusChanged;
 
     /// <summary>
-    /// FIXME: временная заглушка.
+    /// FIXME: Временная заглушка.
     /// Удалить при подключении ModbusTransportSession.
     /// </summary>
     public CoreStatus Start(CoreMap coreMap)
@@ -31,7 +26,7 @@ public sealed unsafe class CoreLinkCore : ICore
     }
 
     /// <summary>
-    /// FIXME: временная заглушка.
+    /// FIXME: Временная заглушка.
     /// Удалить при реализации lifecycle Core.
     /// </summary>
     public CoreStatus Stop()
@@ -40,7 +35,7 @@ public sealed unsafe class CoreLinkCore : ICore
     }
 
     /// <summary>
-    /// FIXME: временная заглушка.
+    /// FIXME: Временная заглушка.
     /// Удалить при реализации согласованного snapshot.
     ///
     /// Указатель не разыменовывается и не сохраняется.

@@ -1,4 +1,4 @@
-﻿using CoreLink.Client;
+using CoreLink.Client;
 using CoreLink.Maps;
 using CoreLink.Contracts.Core;
 using CoreLink.Transport.Diagnostics;
@@ -78,13 +78,13 @@ TestInvalidMap(
 TestInvalidMap(
     "Invalid RegisterOrder",
     testMap.Buffer,
-    buffer => buffer[18] = 99);
+    buffer => buffer[30] = 99);
 
 // Неизвестный RegisterType проверяет защиту от неподдерживаемого типа значения.
 TestInvalidMap(
     "Invalid RegisterType",
     testMap.Buffer,
-    buffer => buffer[23] = 99);
+    buffer => buffer[35] = 99);
 
 // FIXME: Temporary Transport decoder validation helper.
 // Remove after Core -> Transport integration is verified.

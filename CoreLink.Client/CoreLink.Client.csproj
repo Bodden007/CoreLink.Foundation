@@ -1,8 +1,7 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\CoreLink.Contracts\CoreLink.Contracts.csproj" />
-    <ProjectReference Include="..\CoreLink.Core\CoreLink.Core.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
