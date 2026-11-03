@@ -1,3 +1,4 @@
+
 using CoreLink.Contracts.Maps;
 using CoreLink.Maps.Configuration;
 using CoreLink.Maps.Maps;
@@ -25,7 +26,13 @@ public sealed class MapProvider : IMapProvider
             IpAddress = ConnectionMap.IpAddress,
             Port = ConnectionMap.Port,
             UnitId = ConnectionMap.UnitId,
+
             PollIntervalMs = ConnectionMap.PollIntervalMs,
+
+            ConnectTimeoutMs = ConnectionMap.ConnectTimeoutMs,
+            RequestTimeoutMs = ConnectionMap.RequestTimeoutMs,
+            ReconnectDelayMs = ConnectionMap.ReconnectDelayMs,
+
             RegisterOrder = ConnectionMap.Order,
             Registers = registers
         };

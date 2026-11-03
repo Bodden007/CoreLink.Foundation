@@ -1,123 +1,195 @@
+
+using System.Buffers.Binary;
+using CoreLink.Adapter.CSharp;
 using CoreLink.Client;
-using CoreLink.Maps;
+using CoreLink.Client.Results;
 using CoreLink.Contracts.Core;
-using CoreLink.Transport.Diagnostics;
+using CoreLink.Maps;
 
-// TestHost намеренно начинает с реального MapProvider:
-// здесь проверяется не только формат буфера, но и актуальная цепочка Maps -> Contracts.
-var mapProvider =
-    new MapProvider();
+// Интеграционный smoke test.
+//
+// Проверяет реальную цепочку:
+// Maps -> Client -> ICore -> C# Adapter -> Core -> Transport.
+//
+// Не выполняет Write и не изменяет регистры PLC.
 
-// "physical" — текущая тестовая карта проекта.
-// Если она перестала грузиться, дальнейшая проверка transport buffer бессмысленна.
-if (!mapProvider.TryLoad(
-    "physical",
-    out var testMap) ||
-    testMap is null)
+const string mapId = "physical";
+const int testDurationMs = 10_000;
+const int snapshotIntervalMs = 500;
+
+var mapProvider = new MapProvider();
+
+if (!mapProvider.TryLoad(mapId, out var map) ||
+    map is null)
 {
     Console.WriteLine("MAP LOAD FAILED");
     return;
 }
 
-Console.WriteLine();
-Console.WriteLine("======================================");
-Console.WriteLine("CORE MAP BUFFER");
-Console.WriteLine("======================================");
-
-// BufferLength — длина runtime-массива значений, а не размер config buffer.
-// Выводим оба параметра рядом, чтобы не перепутать два независимых контракта.
-Console.WriteLine(
-    $"BufferLength: {testMap.BufferLength}");
-
-Console.WriteLine(
-    $"Config bytes: {testMap.Buffer.Length}");
-
-// HEX оставлен как диагностический "эталон на глаз":
-// при изменении encoder сразу видно изменение бинарного layout.
-Console.WriteLine(
-    $"HEX: {Convert.ToHexString(testMap.Buffer.Span)}");
-
-Console.WriteLine();
-
-// FIXME: Temporary Transport map decoder test.
-// Remove after Core -> Transport integration is verified.
-//
-// Вызов проходит через диагностический декодер Transport, чтобы одна и та же
-// конфигурация проверялась на обеих сторонах будущей границы Core -> Transport.
-TransportMapDiagnostics.Print(
-    testMap.Buffer);
-
-// FIXME: Temporary Transport decoder validation tests.
-// Remove after Core -> Transport integration is verified.
-//
-// Ниже deliberately corrupt один байт за тест: так проще понять,
-// какой именно инвариант decoder обязан отвергнуть.
-Console.WriteLine(
-    "======================================");
-
-Console.WriteLine(
-    "TRANSPORT VALIDATION TESTS");
-
-Console.WriteLine(
-    "======================================");
-
-// Неверная версия проверяет жесткую совместимость формата.
-// Decoder не должен молча интерпретировать неизвестный layout.
-TestInvalidMap(
-    "Invalid Version",
-    testMap.Buffer,
-    buffer => buffer[0] = 99);
-
-// Нулевая длина моделирует поврежденный/усеченный contract buffer.
-TestInvalidMap(
-    "Invalid Length",
-    testMap.Buffer,
-    buffer => buffer[1] = 0);
-
-// Неизвестный RegisterOrder должен отклоняться до начала runtime decoding.
-TestInvalidMap(
-    "Invalid RegisterOrder",
-    testMap.Buffer,
-    buffer => buffer[30] = 99);
-
-// Неизвестный RegisterType проверяет защиту от неподдерживаемого типа значения.
-TestInvalidMap(
-    "Invalid RegisterType",
-    testMap.Buffer,
-    buffer => buffer[35] = 99);
-
-// FIXME: Temporary Transport decoder validation helper.
-// Remove after Core -> Transport integration is verified.
-static void TestInvalidMap(
-    string name,
-    ReadOnlyMemory<byte> source,
-    Action<byte[]> corrupt)
+if (map.Buffer.Length < 14 ||
+    map.BufferLength <= 0)
 {
-    // Работаем с копией, чтобы каждый негативный сценарий начинался
-    // с одной и той же валидной исходной конфигурации.
-    var buffer =
-        source.ToArray();
+    Console.WriteLine("INVALID MAP");
+    return;
+}
 
-    // Corrupt передается снаружи, чтобы helper не знал конкретный layout поля
-    // и оставался простым механизмом проверки ожидаемого отказа.
-    corrupt(buffer);
+int pollIntervalMs =
+    BinaryPrimitives.ReadInt32LittleEndian(
+        map.Buffer.Span.Slice(10, 4));
+
+Console.WriteLine(
+    "======================================");
+
+Console.WriteLine(
+    "CORELINK INTEGRATION TEST");
+
+Console.WriteLine(
+    "======================================");
+
+Console.WriteLine($"Map: {mapId}");
+Console.WriteLine($"Values: {map.BufferLength}");
+Console.WriteLine($"Polling: {pollIntervalMs} ms");
+Console.WriteLine($"Snapshot: {snapshotIntervalMs} ms");
+
+Console.WriteLine();
+
+var adapter = new CSharpCoreAdapter();
+
+var client = new CoreLinkClient(
+    mapProvider,
+    adapter);
+
+adapter.StatusChanged += status =>
+{
+    Console.WriteLine(
+        $"[{DateTime.Now:HH:mm:ss.fff}] CORE STATUS: {status}");
+};
+
+float[] buffer = new float[map.BufferLength];
+
+CoreLinkResult startResult;
+
+try
+{
+    startResult = client.Start(mapId);
+}
+catch (Exception ex)
+{
+    Console.WriteLine(
+        $"START EXCEPTION: {ex}");
+
+    return;
+}
+
+Console.WriteLine($"START RESULT: {startResult}");
+Console.WriteLine($"CLIENT STATE: {client.State}");
+
+if (startResult != CoreLinkResult.Ok)
+{
+    Console.WriteLine("START FAILED");
+    client.Stop();
+    return;
+}
+
+int okCount = 0;
+int noDataCount = 0;
+int disconnectedCount = 0;
+int errorCount = 0;
+
+try
+{
+    int iterations =
+        testDurationMs / snapshotIntervalMs;
+
+    for (int i = 0; i < iterations; i++)
+    {
+        Thread.Sleep(snapshotIntervalMs);
+
+        SnapshotStatus status =
+            ReadSnapshot(adapter, buffer);
+
+        Console.WriteLine();
+
+        Console.WriteLine(
+            $"[{DateTime.Now:HH:mm:ss.fff}] SNAPSHOT: {status}");
+
+        switch (status)
+        {
+            case SnapshotStatus.Ok:
+                okCount++;
+
+                for (int j = 0; j < buffer.Length; j++)
+                {
+                    Console.WriteLine(
+                        $"  [{j}] = {buffer[j]}");
+                }
+
+                break;
+
+            case SnapshotStatus.NoData:
+                noDataCount++;
+                break;
+
+            case SnapshotStatus.Disconnected:
+                disconnectedCount++;
+                break;
+
+            default:
+                errorCount++;
+                break;
+        }
+    }
+}
+finally
+{
+    Console.WriteLine();
+    Console.WriteLine("STOPPING CORE...");
 
     try
     {
-        TransportMapDiagnostics.Print(
-            buffer);
+        client.Stop();
 
-        // Если исключения нет — decoder принял заведомо поврежденный контракт.
         Console.WriteLine(
-            $"{name}: FAILED");
+            $"CLIENT STATE: {client.State}");
     }
-    catch (InvalidOperationException ex)
+    catch (Exception ex)
     {
-        // Для текущего smoke test сам факт контролируемого отказа является успехом.
         Console.WriteLine(
-            $"{name}: OK");
+            $"STOP EXCEPTION: {ex}");
+    }
+}
 
-        Console.WriteLine(
-            $"  {ex.Message}");
+Console.WriteLine();
+Console.WriteLine(
+    "======================================");
+
+Console.WriteLine("TEST SUMMARY");
+
+Console.WriteLine(
+    "======================================");
+
+Console.WriteLine($"Snapshot OK: {okCount}");
+Console.WriteLine($"NoData: {noDataCount}");
+Console.WriteLine($"Disconnected: {disconnectedCount}");
+Console.WriteLine($"Errors: {errorCount}");
+
+Console.WriteLine();
+Console.WriteLine("TEST COMPLETED");
+
+/// <summary>
+/// Передаёт временно закреплённый клиентский массив
+/// через утверждённый контракт ICore.
+///
+/// Указатель действует только внутри вызова.
+/// </summary>
+static unsafe SnapshotStatus ReadSnapshot(
+    ICore core,
+    float[] buffer)
+{
+    fixed (float* pointer = buffer)
+    {
+        return core.GetSnapshot(
+            pointer,
+            buffer.Length);
     }
 }
