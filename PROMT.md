@@ -1,10 +1,10 @@
-# CoreLink.Foundation — архитектурный промт v5
+# CoreLink.Foundation — архитектурный промт v6
 
 **Репозиторий:** https://github.com/Bodden007/CoreLink.Foundation  
 **Ветка:** `main`  
 **Стек:** C# / .NET 10 / NativeAOT / NModbus 3.0.83  
-**Состояние документа:** описывает локальную рабочую копию после реализации Core. **Изменения ещё не отправлены в GitHub.**  
-**Последняя проверка:** `dotnet build CoreLink.Foundation.slnx --no-incremental` — успешна, 7 проектов, без ошибок и предупреждений. Интеграционный запуск выполнен, получение данных от ПЛК не подтверждено.
+**Состояние документа:** актуализировано по GitHub `main` и испытаниям 09.11.2026. Текущий этап: завершение Client и подключение `ICore`.
+**Последняя проверка:** успешный Release Rebuild CoreSimulator и зависимостей; подтверждён обмен с внешним PLC Simulator, reconnect и остановка во время зависшего запроса. Полная NativeAOT-публикация не подтверждена.
 
 ## 1. Назначение и приоритеты
 
@@ -53,11 +53,11 @@ CoreLink.Foundation — фундамент обмена данными межд�
 |---|---|
 | `CoreLink.Contracts` | Общие интерфейсы, статусы, форматы карты и типы регистров |
 | `CoreLink.Maps` | Исходная карта конкретного ПЛК; бинарное кодирование карты v2 |
-| `CoreLink.Client` | Публичная точка запуска/остановки; загрузка карты; владение клиентским `float[]`; в будущем передача значений Rx |
+| `CoreLink.Client` | Уже реализованы загрузка карты, Start/Stop и выделение клиентского `float[]`; получение snapshot через Client — следующий этап |
 | `CoreLink.Adapter.CSharp` | Реализация `ICore`, делегирование операций `CoreLink.Core` |
 | `CoreLink.Core` | Декодирование карты, создание Transport, lifecycle, декодирование регистров, хранение и выдача snapshot, трансляция статусов |
 | `CoreLink.Transport` | Modbus TCP, непрерывный polling, reconnect, timeout, последовательность запросов, приоритет Read/Write, исходные `ushort[]` |
-| `CoreLink.Client.TestHost` | Ручная интеграционная и диагностическая проверка |
+| `CoreLink.Client.TestHost` | Smoke test; пока получает snapshot напрямую через адаптер `ICore`, а не через Client |
 | `CoreLink.NModbus.AotTest` | Отдельный NativeAOT smoke test используемых API NModbus |
 
 Не переносить Modbus-адреса, сетевую логику и детали транспорта в UI, Rx или Client.
@@ -111,7 +111,7 @@ Client periodic request → ICore.GetSnapshot(pointer, length)
 - Текущий предусмотренный интервал получения snapshot со стороны Client/Rx — 500 мс; не путать с `PollIntervalMs` карты.
 - `GetSnapshot()` **не инициирует Modbus-запрос**, не меняет частоту polling и не ждёт сеть.
 - Rx не работает с указателями и не управляет Transport.
-- В текущем `CoreLink.Client` цикл snapshot/Rx ещё не интегрирован как полноценная подсистема; в TestHost он выполняется непосредственно через `ICore`.
+- В текущем `CoreLink.Client` ещё нет получения snapshot. TestHost вызывает `ICore.GetSnapshot` напрямую через адаптер, а не через Client.
 
 ## 6. Контракт памяти и snapshot
 
@@ -155,45 +155,21 @@ Client periodic request → ICore.GetSnapshot(pointer, length)
 
 **Нельзя самовольно менять формат, размеры полей, смысл `BufferLength` и нумерацию типов.** Неверные версии, размеры, типы и диапазоны должны отклоняться до запуска.
 
-## 8. Реализация декодирования и конфигурации — локально добавлена
+## 8. Декодирование карты и конфигурация — реализовано
 
-В `CoreLink.Core` добавлены:
+В GitHub уже присутствуют `CoreLink.Core/Configuration/Decoding/CoreMapDecoder.cs`, `Configuration/Models/DecodedCoreMap.cs`, `Configuration/ModbusConfigFactory.cs` и `Runtime/CoreLinkCore.cs`.
 
-```text
-CoreLink.Core/
-├── Configuration/
-│   ├── Decoding/
-│   │   └── CoreMapDecoder.cs
-│   ├── Models/
-│   │   └── DecodedCoreMap.cs
-│   └── ModbusConfigFactory.cs
-└── Runtime/
-    └── CoreLinkCore.cs
-```
+Core декодирует бинарную карту v2, валидирует параметры и диапазоны, сохраняет описания `Word`/`Float` и порядок регистров. В Transport передаётся только готовый `ModbusConnectionConfig`, без клиентских буферов и указателей. `CoreLink.Maps` формирует карту. Никакой новой фабрики или второго диспетчера в Core не создавать.
 
-- `CoreMapDecoder` читает бинарную карту v2 и возвращает `DecodedCoreMap`.
-- `DecodedCoreMap` содержит параметры соединения, polling и `RegisterDefinition[]`.
-- `ModbusConfigFactory` преобразует только нужные транспортному слою поля в существующий `ModbusConnectionConfig`.
-- `RegisterDefinition[]` и `RegisterOrder` остаются в Core для преобразования polling-данных.
-- `CoreLink.Maps/Maps/ConnectionMap.cs` и `CoreLink.Maps/MapProvider.cs` локально дополнены передачей трёх таймаутов. Значения в текущей тестовой карте: `ConnectTimeoutMs=3000`, `RequestTimeoutMs=1000`, `ReconnectDelayMs=1000`; это текущие настройки, а не универсальные промышленно утверждённые нормативы.
+Конкретные timeout и интервалы выбираются картой. **10 секунд** в недавних испытаниях — тестовое значение `RequestTimeoutMs`, не норматив для эксплуатации. Текущий Core валидирует `RegisterLength <= 125`; автоматическое разбиение запросов за пределами блока не заявлять реализованным.
 
-Не вводить новую транспортную фабрику или отдельный менеджер для единственного `ModbusTransportSession`.
+## 9. Lifecycle Core — реализован и частично проверен
 
-## 9. Core lifecycle — локально реализован
+`CoreLinkCore.Start(CoreMap)` проверяет и декодирует карту, создаёт одну `ModbusTransportSession`, подписывается на события, выделяет собственные буферы декодирования/snapshot и запускает polling. `Running` не означает успешное подключение к PLC.
 
-`CoreLinkCore.Start(CoreMap)`:
+`CoreLinkCore.Stop()` синхронно завершает Transport, очищает Core snapshot и возвращает `Stopped`. Повторный `Start` на одном экземпляре не предусмотрен.
 
-1. Проверяет и декодирует карту.
-2. Проверяет параметры подключения, polling, диапазоны и количество значений.
-3. Формирует `ModbusConnectionConfig`.
-4. Создаёт единственный `ModbusTransportSession`.
-5. Подписывается на `RegistersReceived` и `TransportStatusChanged`.
-6. Создаёт внутренние буферы значений и запускает Transport.
-7. Возвращает `Running`, **не ожидая успешного подключения к ПЛК**.
-
-`CoreLinkCore.Stop()` синхронный: останавливает и освобождает Transport, очищает внутренние буферы, возвращает `Stopped`. Повторный Start того же экземпляра после Stop не предусматривается.
-
-**Граница проверки:** код компилируется; успешное завершение Stop подтверждено только одним интеграционным сценарием. Конкурентные `Start`/`Stop`, исключения callback, fault во время startup, долгий незавершённый запрос и повторные остановки не подтверждены эксплуатационными тестами. Не объявлять lifecycle полностью проверенным до таких испытаний.
+В испытаниях подтверждены нормальный обмен, восстановление связи, обнаружение зависшего PLC и завершение Stop при активном FC04. **Stop занял 5776 мс** при `RequestTimeoutMs=10000` и возрасте активного запроса `4237 мс` (`RequestInProgress=True`). Это согласуется с ожиданием оставшегося таймаута: мгновенная отмена I/O **не доказана**. Оптимизацию остановки отложить, не блокировать Client. Полностью конкурентный lifecycle и долговременная промышленная надёжность не подтверждены.
 
 ## 10. Декодирование polling-данных
 
@@ -238,51 +214,21 @@ Core принимает пользовательские команды и тр�
 
 При ошибках сохранять возможность диагностики. Не добавлять бесконечный повторяющийся информационный лог на каждом неудачном тике без политики ограничения частоты.
 
-## 13. Текущая проверка интеграции — факты
+## 13. Интеграционные испытания — актуальные факты
 
-**Последняя локальная сборка:**
+**Цепочка в репозитории:** `MapProvider → CoreLinkClient.Start/Stop → ICore → CSharpCoreAdapter → CoreLinkCore → ModbusTransportSession`. В `CoreLink.Client.TestHost` получение snapshot пока вызывается **напрямую через адаптер**, поэтому считать Client интегрированным со snapshot нельзя.
 
-```powershell
-dotnet build CoreLink.Foundation.slnx --no-incremental
-```
+Внешние тестовые приложения (не входят в `CoreLink.Foundation.slnx`): `CoreLink.PlcSimulator` и `CoreLink.CoreSimulator` в проекте `TestCorlink`. PLC Simulator предоставляет TCP Modbus FC04 на `127.0.0.1:1502`, контролируемые `Word/Float32`, режимы stable/cycle/HANG. CoreSimulator работает с реальным `ICore`, показывает значения и статусы.
 
-Результат пользователя: **7 проектов, 0 ошибок, 0 предупреждений**.
+**Проверено пользователем:** `SnapshotStatus.Ok` с обновлением значений и сопоставлением регистров, отсутствие ложного Ok без данных, отключение и восстановление связи, `NoData` до первого ответа, реакция на HANG с открытым TCP и отсутствием FC04-ответа.
 
-**Интеграционный TestHost:**
+**Последний тест 09.11.2026:** `11:39:44.918 Running`, `11:39:55.029 Disconnected`, `11:41:23.937 STOP BEGIN` с `RequestInProgress=True` и `CurrentRequestAgeMs=4237`, `11:41:29.709 Stopped`. В этой сессии успешных ответов не было, поэтому `SnapshotStatus.NoData` ожидаем.
 
-```powershell
-dotnet run --project CoreLink.Client.TestHost
-```
+Выполнен успешный `dotnet build -c Release -t:Rebuild` внешнего CoreSimulator и зависимостей; методом reflection подтверждён `PrintStopDiagnostics` в `CoreLink.Transport.dll`.
 
-Цепочка: `MapProvider → CoreLinkClient → ICore → CSharpCoreAdapter → CoreLinkCore → ModbusTransportSession`.
+**Технический долг:** в `CoreLink.Transport/Modbus/ModbusTransportSession.cs` временные сообщения Stop с `TODO DEBUG`/`FIXME`. Удалить по завершении необходимости в отладке. Не считать диагностические поля стабильным API. Не повторять длительные ручные тесты без отдельного проверяемого вопроса.
 
-Из полученного пользователем вывода:
-
-```text
-Map: physical
-Values: 8
-Polling: 500 ms
-Snapshot: 500 ms
-CORE STATUS: Running
-START RESULT: Ok
-CLIENT STATE: Running
-CORE STATUS: Disconnected
-Snapshot OK: 0
-NoData: 20
-Disconnected: 0
-Errors: 0
-CORE STATUS: Stopped
-CLIENT STATE: Stopped
-TEST COMPLETED
-```
-
-**Подтверждено:** загрузка карты, старт цепочки, передача статуса `Disconnected`, отсутствие падения тестового процесса в данном сценарии, синхронное завершение и переход в `Stopped`.
-
-**Не подтверждено:** успешное подключение к ПЛК, получение непустых регистров, правильность Float32, наполнение клиентского буфера значениями, reconnect после восстановления, реальная арбитрация одиночного Read/Write через Core, устойчивость при длительной работе.
-
-`NoData` после `Disconnected` в данном сценарии объясняется отсутствием первого успешного snapshot и текущим порядком проверок `GetSnapshot()`; это не доказательство успешного обмена.
-
-Точный сетевой отказ тестом не выявлен. Не утверждать, что причина — именно timeout, недоступный IP или конкретное устройство, без дополнительной диагностики.
+**Не доказано:** полный охват отказов, все 4 порядка Float32 на независимых векторах, NativeAOT publish всего приложения, эксплуатационная сертификация.
 
 ## 14. NativeAOT
 
@@ -314,40 +260,26 @@ NativeAOT — обязательное требование. NModbus 3.0.83 ра
 
 Порядок: **изучить текущий код → зафиксировать границу задачи → полный файл → build → тест → human review → commit**.
 
-## 16. Статус GitHub и локальных изменений
+## 16. Статус репозитория
 
-На момент подготовки v5 **пользователь ещё не выполнил push**. Не считать локальную версию Core опубликованной в `main`.
+В GitHub `main` уже находятся `CoreLink.Contracts`, `CoreLink.Maps`, `CoreLink.Transport`, `CoreLink.Core`, `CoreLink.Adapter.CSharp`, `CoreLink.Client` и `CoreLink.Client.TestHost`. Неверно считать их неопубликованными локальными изменениями.
 
-Изменения, обсуждённые и собранные локально:
+В `CoreLink.Client/CoreLinkClient.cs` **уже есть** конструктор `(IMapProvider mapProvider, ICore core)`, `Start(string mapId)`, `Stop()`, `State`, `CoreMap`. Клиент создаёт `float[]` нужной длины; при этом **не содержит публичного метода получения snapshot**. Продолжать эту реализацию, а не писать параллельный Client.
 
-- `CoreLink.Core/Configuration/Models/DecodedCoreMap.cs`;
-- `CoreLink.Core/Configuration/Decoding/CoreMapDecoder.cs`;
-- `CoreLink.Core/Configuration/ModbusConfigFactory.cs`;
-- `CoreLink.Core/Runtime/CoreLinkCore.cs`;
-- `CoreLink.Maps/Maps/ConnectionMap.cs`;
-- `CoreLink.Maps/MapProvider.cs`;
-- `CoreLink.Client.TestHost/CoreLink.Client.TestHost.csproj`;
-- `CoreLink.Client.TestHost/Program.cs`.
+Состояние GitHub и локального рабочего дерева различать: после изменений на GitHub перед локальной работой проверить `git status` и синхронизировать ветку.
 
-Это список по ходу работы в чате, **не результат `git status`**. Перед commit проверить реальные изменения локального рабочего дерева.
+## 17. Следующий этап — CoreLink.Client, подключение ядра
 
-Предложенное имя коммита:
+**Задача:** завершить существующий `CoreLink.Client`, подключив чтение готового snapshot через `ICore` и подготовив контракт для следующего слоя Rx.
 
-```text
-Implement Core lifecycle, Modbus integration and snapshot handling
-```
+1. Изучить актуальные `CoreLinkClient.cs`, `ICore`, текущие статусы и TestHost; сохранить имена, структуру, уже работающие методы.
+2. Согласовать минимальный публичный API Client для snapshot. Не менять интерфейс `ICore`, бинарную карту или Core.
+3. Применить уже выделенный клиентский `float[]`. В момент синхронного `GetSnapshot(float*, int)` временно закреплять его через `fixed`; Core не хранит указатель. Rx и UI с указателями не работают.
+4. Организовать чтение snapshot независимо от физического polling (ориентир — 500 мс, отдельный параметр); при Stop исключить гонку чтения и освобождения клиентского буфера.
+5. Сохранять семантику `Ok`/`NoData`/`Disconnected`/`Stopped`/`BadBuffer`; при не-Ok не публиковать прежние значения как свежие.
+6. Перевести TestHost на **чтение через Client**, затем отдельным этапом подключать `CoreLink.Rx` и Avalonia.
 
-Коммит и push не подтверждены.
+**Не делать на этом этапе:** Rust/FFI, OPC UA, переписывание Transport, новый `Read/Write` API, расширение `ICore` и преждевременные оптимизации.
 
-## 17. Следующая точка разработки
+**Рабочий порядок:** только по одному файлу/изменению за шаг; полный код файла в чате по запросу, минимальный diff, build и целевой тест. Не превращать исследование в бесконечную серию проверок. Архитектура определяется разработчиком.
 
-1. Проверить доступность Modbus TCP-устройства по конфигурации карты и получить успешный polling.
-2. Подтвердить реальные значения `Word`/`Float32` и `SnapshotStatus.Ok` через полный маршрут `Client → Adapter → Core → Transport`.
-3. Проверить восстановление связи и согласованность snapshot на реальном/контролируемом тестовом устройстве.
-4. После подтверждения штатного обмена — отдельно согласовать публичные методы одиночного Read/Write в `ICore` и подключение Rx.
-5. Проверить lifecycle и NativeAOT на целевой сборке; не путать это с успешным обычным `dotnet build`.
-
-Не начинать Rust, OPC UA и абстракции нескольких протоколов без нового решения пользователя.
-
-**Главное правило: зафиксированные решения не пересматриваются по кругу. Сначала факты существующего проекта, затем минимальное изменение, затем проверка.**
- 
