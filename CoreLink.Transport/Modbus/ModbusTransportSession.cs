@@ -1,3 +1,5 @@
+
+using System.Diagnostics;
 using CoreLink.Transport.Modbus.Configuration;
 using CoreLink.Transport.Modbus.Connection;
 using CoreLink.Transport.Modbus.Dispatching;
@@ -11,9 +13,6 @@ namespace CoreLink.Transport.Modbus;
 ///
 /// Сессия владеет TCP-соединением, диспетчером запросов
 /// и постоянным циклом polling.
-///
-/// Штатные transport-ошибки возвращаются через
-/// ModbusTransportStatus и не требуют анализа исключений.
 /// </summary>
 public sealed class ModbusTransportSession : IAsyncDisposable
 {
@@ -24,36 +23,12 @@ public sealed class ModbusTransportSession : IAsyncDisposable
 
     private bool _disposed;
 
-    /// <summary>
-    /// Вызывается после успешного штатного polling-чтения.
-    ///
-    /// Массив содержит Input Registers в порядке,
-    /// полученном от Modbus-устройства.
-    /// </summary>
     public event Action<ushort[]>? RegistersReceived;
 
-    /// <summary>
-    /// Публикует неуспешный статус штатного polling.
-    ///
-    /// Ошибка одного запроса не останавливает transport-сессию.
-    /// Следующая попытка снова проходит через Transport,
-    /// который при необходимости выполняет reconnect.
-    /// </summary>
     public event Action<ModbusTransportStatus>? TransportStatusChanged;
 
-    /// <summary>
-    /// Показывает, запущен ли постоянный polling.
-    /// </summary>
-    public bool IsRunning =>
-        _poller.IsRunning;
+    public bool IsRunning => _poller.IsRunning;
 
-    /// <summary>
-    /// Создаёт одну Modbus TCP-сессию.
-    ///
-    /// Конструктор создаёт внутренние transport-компоненты,
-    /// но не устанавливает TCP-соединение.
-    /// Подключение выполняется лениво при первом запросе.
-    /// </summary>
     public ModbusTransportSession(
         ModbusConnectionConfig config)
     {
@@ -62,47 +37,26 @@ public sealed class ModbusTransportSession : IAsyncDisposable
         _config = config;
 
         _connectionManager =
-            new ModbusConnectionManager(
-                config);
+            new ModbusConnectionManager(config);
 
         _dispatcher =
-            new ModbusRequestDispatcher(
-                _connectionManager);
+            new ModbusRequestDispatcher(_connectionManager);
 
         _poller =
-            new ModbusPoller(
-                _dispatcher,
-                config);
+            new ModbusPoller(_dispatcher, config);
 
-        _poller.RegistersReceived +=
-            OnRegistersReceived;
-
-        _poller.PollingStatusChanged +=
-            OnPollingStatusChanged;
+        _poller.RegistersReceived += OnRegistersReceived;
+        _poller.PollingStatusChanged += OnPollingStatusChanged;
     }
 
-    /// <summary>
-    /// Запускает dispatcher и постоянный polling.
-    ///
-    /// Dispatcher запускается первым, чтобы первый polling-запрос
-    /// сразу имел работающего исполнителя.
-    /// </summary>
     public void Start()
     {
-        ObjectDisposedException.ThrowIf(
-            _disposed,
-            this);
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
         _dispatcher.Start();
         _poller.Start();
     }
 
-    /// <summary>
-    /// Асинхронно останавливает transport-сессию.
-    ///
-    /// Сначала прекращается polling, затем завершается
-    /// единственный dispatcher worker.
-    /// </summary>
     public async Task StopAsync()
     {
         if (_disposed)
@@ -112,12 +66,6 @@ public sealed class ModbusTransportSession : IAsyncDisposable
         await _dispatcher.StopAsync();
     }
 
-    /// <summary>
-    /// Ставит запись одного Holding Register
-    /// в высокоприоритетную очередь.
-    ///
-    /// Результат содержит детерминированный transport status.
-    /// </summary>
     public Task<ModbusWriteResult> WriteSingleRegisterAsync(
         ushort address,
         ushort value)
@@ -130,12 +78,6 @@ public sealed class ModbusTransportSession : IAsyncDisposable
             value);
     }
 
-    /// <summary>
-    /// Ставит запись блока Holding Registers
-    /// в высокоприоритетную очередь.
-    ///
-    /// Результат содержит детерминированный transport status.
-    /// </summary>
     public Task<ModbusWriteResult> WriteMultipleRegistersAsync(
         ushort startAddress,
         ushort[] values)
@@ -148,12 +90,6 @@ public sealed class ModbusTransportSession : IAsyncDisposable
             values);
     }
 
-    /// <summary>
-    /// Выполняет одиночное чтение Input Registers.
-    ///
-    /// Single read имеет самый низкий приоритет.
-    /// При ошибке Data == null, а причина содержится в Status.
-    /// </summary>
     public Task<ModbusReadResult> ReadSingleAsync(
         ushort startAddress,
         ushort count)
@@ -166,37 +102,20 @@ public sealed class ModbusTransportSession : IAsyncDisposable
             count);
     }
 
-    /// <summary>
-    /// Передаёт штатные polling-данные владельцу сессии.
-    /// </summary>
-    private void OnRegistersReceived(
-        ushort[] registers)
+    private void OnRegistersReceived(ushort[] registers)
     {
-        RegistersReceived?.Invoke(
-            registers);
+        RegistersReceived?.Invoke(registers);
     }
 
-    /// <summary>
-    /// Передаёт transport-status polling владельцу сессии.
-    /// </summary>
     private void OnPollingStatusChanged(
         ModbusTransportStatus status)
     {
-        TransportStatusChanged?.Invoke(
-            status);
+        TransportStatusChanged?.Invoke(status);
     }
 
-    /// <summary>
-    /// Проверяет lifecycle сессии перед постановкой новой операции.
-    ///
-    /// Ошибка использования API не является сетевым состоянием
-    /// и поэтому не преобразуется в ModbusTransportStatus.
-    /// </summary>
     private void ThrowIfNotAvailable()
     {
-        ObjectDisposedException.ThrowIf(
-            _disposed,
-            this);
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
         if (!_dispatcher.IsRunning)
         {
@@ -205,40 +124,101 @@ public sealed class ModbusTransportSession : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Возвращает Unit Identifier текущей сессии.
-    ///
-    /// FIXME:
-    /// После окончательной фиксации transport API убрать дублирование
-    /// slaveId во внутренних вызовах.
-    /// </summary>
     private byte GetSlaveId()
     {
         return _config.SlaveId;
     }
 
+    // TODO DEBUG: Remove temporary transport stop diagnostics after testing.
     /// <summary>
-    /// Асинхронно завершает Modbus TCP-сессию сверху вниз.
+    /// FIXME: временная диагностика Stop.
+    /// Удалить после испытаний зависшего I/O.
     ///
-    /// Сначала прекращается производство запросов,
-    /// затем dispatcher, после чего уничтожается TCP-сессия.
+    /// Поля ConnectionManager читаются без единого
+    /// диагностического snapshot-lock, поэтому значения
+    /// носят наблюдательный характер.
+    /// </summary>
+    private void PrintStopDiagnostics(string stage)
+    {
+        DateTime? started =
+            _connectionManager.CurrentRequestStartedAt;
+
+        double elapsedMs = started.HasValue
+            ? Math.Max(
+                0,
+                (DateTime.Now - started.Value).TotalMilliseconds)
+            : 0;
+
+        Console.WriteLine();
+        Console.WriteLine(
+            $"[TRANSPORT {stage}] {DateTime.Now:HH:mm:ss.fff}");
+
+        Console.WriteLine(
+            $"  RequestInProgress    = {_connectionManager.RequestInProgress}");
+
+        Console.WriteLine(
+            $"  RequestIsHung        = {_connectionManager.RequestIsHung}");
+
+        Console.WriteLine(
+            $"  CurrentRequestAgeMs  = {elapsedMs:F0}");
+
+        Console.WriteLine(
+            $"  LastRequestMs        = {_connectionManager.LastRequestMs}");
+
+        Console.WriteLine(
+            $"  MaxRequestMs         = {_connectionManager.MaxRequestMs}");
+
+        Console.WriteLine(
+            $"  RequestStartedCount  = {_connectionManager.RequestStartedCount}");
+
+        Console.WriteLine(
+            $"  RequestCompletedCount= {_connectionManager.RequestCompletedCount}");
+
+        Console.WriteLine(
+            $"  HungRequestCount     = {_connectionManager.HungRequestCount}");
+
+        Console.WriteLine(
+            $"  RecoveredRequestCount= {_connectionManager.RecoveredRequestCount}");
+
+        Console.WriteLine(
+            $"  PollerRunning        = {_poller.IsRunning}");
+
+        Console.WriteLine(
+            $"  DispatcherRunning    = {_dispatcher.IsRunning}");
+    }
+
+    /// <summary>
+    /// Завершает Transport и измеряет время остановки.
     /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
             return;
 
-        _poller.RegistersReceived -=
-            OnRegistersReceived;
+        // FIXME: временная диагностика.
+        Stopwatch stopwatch = Stopwatch.StartNew();
 
-        _poller.PollingStatusChanged -=
-            OnPollingStatusChanged;
+        PrintStopDiagnostics("STOP BEGIN");
+
+        _poller.RegistersReceived -= OnRegistersReceived;
+        _poller.PollingStatusChanged -= OnPollingStatusChanged;
 
         await _poller.DisposeAsync();
+
+        PrintStopDiagnostics("POLLER STOPPED");
+
         await _dispatcher.DisposeAsync();
+
+        PrintStopDiagnostics("DISPATCHER STOPPED");
 
         _connectionManager.Dispose();
 
         _disposed = true;
+
+        stopwatch.Stop();
+
+        Console.WriteLine(
+            $"[TRANSPORT STOP COMPLETE] " +
+            $"Elapsed={stopwatch.Elapsed.TotalMilliseconds:F1} ms");
     }
 }
