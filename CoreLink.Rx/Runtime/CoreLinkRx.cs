@@ -35,9 +35,13 @@ public readonly record struct RxValue(
 /// </summary>
 public sealed class CoreLinkRx : IAsyncDisposable
 {
+    private const int DefaultUnitSystemId = 1;
+
+    private const string UnknownUnit = "—";
+
     private readonly SnapshotReader? _snapshotReader;
     private readonly RxValueDefinition[] _definitions;
-    private readonly int _unitSystemValueId;
+    private readonly int? _unitSystemValueId;
     private readonly int _intervalMs;
     private readonly float[] _buffer;
     private readonly bool _configurationValid;
@@ -57,6 +61,7 @@ public sealed class CoreLinkRx : IAsyncDisposable
 
     private int? _unitSystemId;
     private SnapshotStatus? _lastStatus;
+    private string? _lastUnitError;
 
     private bool _hasData;
     private bool _stopped;
@@ -74,7 +79,7 @@ public sealed class CoreLinkRx : IAsyncDisposable
     public CoreLinkRx(
         SnapshotReader snapshotReader,
         IReadOnlyList<RxValueDefinition> definitions,
-        int unitSystemValueId,
+        int? unitSystemValueId,
         int intervalMs)
     {
         _snapshotReader = snapshotReader;
@@ -108,8 +113,12 @@ public sealed class CoreLinkRx : IAsyncDisposable
         if (_definitions.Length == 0)
             return ConfigurationError("Rx definitions are empty.");
 
-        if ((uint)_unitSystemValueId >= (uint)_definitions.Length)
-            return ConfigurationError("Invalid unit system ValueId.");
+        if (_unitSystemValueId is int valueId &&
+            (uint)valueId >= (uint)_definitions.Length)
+        {
+            return ConfigurationError(
+                "Invalid Measurme ValueId.");
+        }
 
         var names = new HashSet<string>(StringComparer.Ordinal);
 
@@ -122,12 +131,16 @@ public sealed class CoreLinkRx : IAsyncDisposable
                 return ConfigurationError("Rx value name is empty.");
 
             if (!names.Add(definition.Name))
+            {
                 return ConfigurationError(
                     $"Duplicate Rx value name: {definition.Name}");
+            }
 
             if (definition.Units is null)
+            {
                 return ConfigurationError(
                     $"Units are null: {definition.Name}");
+            }
         }
 
         return true;
@@ -180,8 +193,7 @@ public sealed class CoreLinkRx : IAsyncDisposable
     /// Следующая итерация начинается после обработки
     /// предыдущей и выдерживания заданного интервала.
     ///
-    /// Ошибка запроса не создаёт очередь повторов
-    /// и не останавливает остальные компоненты.
+    /// Ошибка запроса не создаёт очередь повторов.
     /// </summary>
     private async Task RunAsync(
         CancellationToken cancellationToken)
@@ -205,6 +217,14 @@ public sealed class CoreLinkRx : IAsyncDisposable
                         {
                             ProcessValues(values.Span);
                         }
+                    }
+
+                    if (!_hasData &&
+                        _unitSystemValueId.HasValue &&
+                        status != SnapshotStatus.Ok)
+                    {
+                        ReportUnitError(
+                            "Measurme unavailable: no valid snapshot.");
                     }
 
                     if (_lastStatus != status)
@@ -249,12 +269,35 @@ public sealed class CoreLinkRx : IAsyncDisposable
     /// <summary>
     /// Сравнивает значения с последним успешным snapshot.
     /// Публикует только изменённые значения или единицы.
-    /// Первый успешный snapshot публикуется полностью.
+    ///
+    /// Без Measurme используется UA (1).
+    /// Существующий Measurme определяет систему из PLC.
     /// </summary>
     private void ProcessValues(ReadOnlySpan<float> values)
     {
-        int? nextUnitSystemId =
-            GetUnitSystemId(values[_unitSystemValueId]);
+        int? nextUnitSystemId;
+
+        if (_unitSystemValueId is int valueId)
+        {
+            float rawUnitId = values[valueId];
+
+            nextUnitSystemId = GetUnitSystemId(rawUnitId);
+
+            if (nextUnitSystemId is not (1 or 2))
+            {
+                ReportUnitError(
+                    $"Invalid Measurme value: {rawUnitId}.");
+            }
+            else
+            {
+                ClearUnitError();
+            }
+        }
+        else
+        {
+            nextUnitSystemId = DefaultUnitSystemId;
+            ClearUnitError();
+        }
 
         bool firstSnapshot = !_hasData;
 
@@ -265,10 +308,10 @@ public sealed class CoreLinkRx : IAsyncDisposable
 
             RxValueDefinition definition = _definitions[i];
 
-            string? newUnit =
+            string newUnit =
                 GetUnit(definition, nextUnitSystemId);
 
-            string? oldUnit =
+            string oldUnit =
                 GetUnit(definition, _unitSystemId);
 
             bool valueChanged = !newValue.Equals(oldValue);
@@ -295,9 +338,8 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Получает общий идентификатор системы единиц PLC.
-    /// Неизвестные значения не заменяются системой
-    /// по умолчанию.
+    /// Проверяет числовой идентификатор PLC.
+    /// Неизвестные значения не подменяются системой 1.
     /// </summary>
     private static int? GetUnitSystemId(float value)
     {
@@ -312,18 +354,69 @@ public sealed class CoreLinkRx : IAsyncDisposable
         return (int)value;
     }
 
-    private static string? GetUnit(
+    /// <summary>
+    /// Возвращает обозначение единицы.
+    ///
+    /// Отсутствующая единица имеет пустое обозначение.
+    /// Неизвестная система обозначается прочерком.
+    /// </summary>
+    private static string GetUnit(
         RxValueDefinition definition,
         int? systemId)
     {
-        if (!systemId.HasValue)
-            return null;
+        if (systemId is not (1 or 2))
+            return UnknownUnit;
 
         return definition.Units.TryGetValue(
             systemId.Value,
             out string? unit)
-            ? unit
-            : null;
+            ? unit ?? string.Empty
+            : string.Empty;
+    }
+
+    /// <summary>
+    /// Диагностирует изменение причины ошибки Unit.
+    /// Одинаковая ошибка не повторяется на каждом цикле.
+    ///
+    /// TODO: Передать событие UnitError
+    /// в централизованный логгер.
+    /// </summary>
+    private void ReportUnitError(string message)
+    {
+        if (string.Equals(
+                _lastUnitError,
+                message,
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _lastUnitError = message;
+        ReportError(message);
+    }
+
+    /// <summary>
+    /// Фиксирует восстановление корректной системы.
+    ///
+    /// TODO: Передать событие восстановления Unit
+    /// в централизованный логгер.
+    /// </summary>
+    private void ClearUnitError()
+    {
+        if (_lastUnitError is null)
+            return;
+
+        _lastUnitError = null;
+
+        try
+        {
+            Trace.TraceInformation(
+                "Measurme unit selection restored.");
+        }
+        catch (Exception)
+        {
+            // Диагностика не должна останавливать Rx.
+        }
     }
 
     /// <summary>
