@@ -1,33 +1,8 @@
 
+using CoreLink.Contracts.Maps;
 using CoreLink.Maps.Definitions;
 
 namespace CoreLink.Maps.Configuration;
-
-/// <summary>
-/// Описание значения для managed-карты.
-/// Позиция в массиве определяет ValueId.
-/// </summary>
-public readonly record struct RxMapValue(
-    string Name,
-    string AmericanUnit,
-    string MetricUnit);
-
-/// <summary>
-/// Подготовленная конфигурация реактивного слоя.
-/// Не содержит физических адресов регистров.
-/// </summary>
-public sealed class RxMapConfiguration
-{
-    public required RxMapValue[] Values { get; init; }
-
-    /// <summary>
-    /// Индекс регистра Measurme.
-    /// Null означает отсутствие регистра и систему UA по умолчанию.
-    /// </summary>
-    public int? UnitSystemValueId { get; init; }
-
-    public int RxIntervalMs { get; init; }
-}
 
 /// <summary>
 /// Формирует managed-карту Rx из физических определений.
@@ -35,6 +10,9 @@ public sealed class RxMapConfiguration
 /// Поиск Measurme и преобразование единиц выполняются
 /// только при подготовке конфигурации.
 /// В рабочем цикле Rx строкового поиска нет.
+///
+/// Контракты RxMapConfiguration и RxMapValue
+/// принадлежат CoreLink.Contracts.
 /// </summary>
 internal static class RxMapBuilder
 {

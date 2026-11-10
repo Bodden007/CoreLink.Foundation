@@ -68,6 +68,7 @@ public sealed class MapProvider : IMapProvider
     /// Порядок значений соответствует RegisterMap.
     /// ValueId равен индексу элемента.
     ///
+    /// Интервал Rx берётся из конфигурации сборки.
     /// Не создаёт Rx и не управляет его lifecycle.
     /// </summary>
     public bool TryLoadRxMap(
@@ -77,7 +78,7 @@ public sealed class MapProvider : IMapProvider
     {
         return RxMapBuilder.TryBuild(
             RegisterMap.Registers,
-            500,
+            ConnectionMap.RxIntervalMs,
             out rxMap,
             out error);
     }
