@@ -1,5 +1,6 @@
 
 using System.Buffers.Binary;
+using System.Reactive.Linq;
 using CoreLink.Adapter.CSharp;
 using CoreLink.Client;
 using CoreLink.Client.Results;
@@ -8,13 +9,17 @@ using CoreLink.Maps;
 
 // Интеграционный smoke test.
 //
-// Проверяет реальную цепочку:
-// Maps -> Client -> ICore -> C# Adapter -> Core -> Transport.
+// Проверяет цепочку:
+// TestHost -> Client -> Rx -> Client -> ICore
+//                         -> Core -> Transport -> PLC
 //
-// Не выполняет Write и не изменяет регистры PLC.
+// Публичное чтение snapshot выполняется параллельно
+// с собственным рабочим циклом Rx.
+//
+// Тест не выполняет Write и не изменяет регистры PLC.
 
 const string mapId = "physical";
-const int testDurationMs = 10_000;
+const int testDurationMs = 60_000;
 const int snapshotIntervalMs = 500;
 
 var mapProvider = new MapProvider();
@@ -26,8 +31,20 @@ if (!mapProvider.TryLoad(mapId, out var map) ||
     return;
 }
 
+if (!mapProvider.TryLoadRxMap(
+        mapId,
+        out var rxMap,
+        out string? mapError) ||
+    rxMap is null)
+{
+    Console.WriteLine(
+        $"RX MAP LOAD FAILED: {mapError}");
+    return;
+}
+
 if (map.Buffer.Length < 14 ||
-    map.BufferLength <= 0)
+    map.BufferLength <= 0 ||
+    map.BufferLength != rxMap.Values.Length)
 {
     Console.WriteLine("INVALID MAP");
     return;
@@ -37,159 +54,181 @@ int pollIntervalMs =
     BinaryPrimitives.ReadInt32LittleEndian(
         map.Buffer.Span.Slice(10, 4));
 
-Console.WriteLine(
-    "======================================");
-
-Console.WriteLine(
-    "CORELINK INTEGRATION TEST");
-
-Console.WriteLine(
-    "======================================");
-
+Console.WriteLine("======================================");
+Console.WriteLine("CORELINK CLIENT + RX TEST");
+Console.WriteLine("======================================");
 Console.WriteLine($"Map: {mapId}");
 Console.WriteLine($"Values: {map.BufferLength}");
 Console.WriteLine($"Polling: {pollIntervalMs} ms");
-Console.WriteLine($"Snapshot: {snapshotIntervalMs} ms");
-
+Console.WriteLine($"Rx interval: {rxMap.RxIntervalMs} ms");
+Console.WriteLine($"Test duration: {testDurationMs} ms");
 Console.WriteLine();
 
 var adapter = new CSharpCoreAdapter();
+var client = new CoreLinkClient(mapProvider, adapter);
 
-var client = new CoreLinkClient(
-    mapProvider,
-    adapter);
+var outputLock = new object();
+
+int rxValueCount = 0;
+int rxStatusCount = 0;
+int snapshotOkCount = 0;
+int snapshotNoDataCount = 0;
+int snapshotDisconnectedCount = 0;
+int snapshotErrorCount = 0;
 
 adapter.StatusChanged += status =>
 {
-    Console.WriteLine(
-        $"[{DateTime.Now:HH:mm:ss.fff}] CORE STATUS: {status}");
+    WriteLine($"CORE STATUS: {status}");
 };
 
-float[] buffer = new float[map.BufferLength];
+IDisposable? valuesSubscription = null;
+IDisposable? statusesSubscription = null;
 
-CoreLinkResult startResult;
+CoreLinkResult startResult = CoreLinkResult.SessionError;
+CoreLinkResult stopResult = CoreLinkResult.SessionError;
 
 try
 {
     startResult = client.Start(mapId);
-}
-catch (Exception ex)
-{
-    Console.WriteLine(
-        $"START EXCEPTION: {ex}");
 
-    return;
-}
+    WriteLine($"START RESULT: {startResult}");
+    WriteLine($"CLIENT STATE: {client.State}");
 
-Console.WriteLine($"START RESULT: {startResult}");
-Console.WriteLine($"CLIENT STATE: {client.State}");
-
-if (startResult != CoreLinkResult.Ok)
-{
-    Console.WriteLine("START FAILED");
-    client.Stop();
-    return;
-}
-
-int okCount = 0;
-int noDataCount = 0;
-int disconnectedCount = 0;
-int errorCount = 0;
-
-try
-{
-    int iterations =
-        testDurationMs / snapshotIntervalMs;
-
-    for (int i = 0; i < iterations; i++)
+    if (startResult == CoreLinkResult.Ok)
     {
-        Thread.Sleep(snapshotIntervalMs);
+        var valuesStream = client.Values;
+        var statusesStream = client.Statuses;
 
-        SnapshotStatus status =
-            ReadSnapshot(adapter, buffer);
-
-        Console.WriteLine();
-
-        Console.WriteLine(
-            $"[{DateTime.Now:HH:mm:ss.fff}] SNAPSHOT: {status}");
-
-        switch (status)
+        if (valuesStream is null ||
+            statusesStream is null)
         {
-            case SnapshotStatus.Ok:
-                okCount++;
+            WriteLine("RX STREAMS UNAVAILABLE");
+        }
+        else
+        {
+            valuesSubscription = valuesStream.Subscribe(value =>
+            {
+                Interlocked.Increment(ref rxValueCount);
 
-                for (int j = 0; j < buffer.Length; j++)
+                WriteLine(
+                    $"RX VALUE [{value.ValueId}] " +
+                    $"{value.Name} = {value.Value} " +
+                    $"{value.Unit}");
+            });
+
+            statusesSubscription = statusesStream.Subscribe(status =>
+            {
+                Interlocked.Increment(ref rxStatusCount);
+
+                WriteLine($"RX STATUS: {status}");
+            });
+
+            // CoreLinkRx — hot stream без replay.
+            // Публикации до подписки могут быть пропущены.
+
+            int iterations =
+                testDurationMs / snapshotIntervalMs;
+
+            for (int i = 0; i < iterations; i++)
+            {
+                await Task.Delay(snapshotIntervalMs);
+
+                // Публичный snapshot использует _coreBuffer.
+                // Рабочий цикл Rx использует _rxBuffer.
+                // Оба обращения синхронизированы Client.
+                SnapshotStatus status =
+                    client.GetSnapshot(out var snapshot);
+
+                switch (status)
                 {
-                    Console.WriteLine(
-                        $"  [{j}] = {buffer[j]}");
+                    case SnapshotStatus.Ok:
+                        snapshotOkCount++;
+
+                        WriteLine(
+                            $"SNAPSHOT: Ok, values={snapshot.Length}");
+
+                        break;
+
+                    case SnapshotStatus.NoData:
+                        snapshotNoDataCount++;
+                        WriteLine("SNAPSHOT: NoData");
+                        break;
+
+                    case SnapshotStatus.Disconnected:
+                        snapshotDisconnectedCount++;
+                        WriteLine("SNAPSHOT: Disconnected");
+                        break;
+
+                    default:
+                        snapshotErrorCount++;
+                        WriteLine($"SNAPSHOT: {status}");
+                        break;
                 }
-
-                break;
-
-            case SnapshotStatus.NoData:
-                noDataCount++;
-                break;
-
-            case SnapshotStatus.Disconnected:
-                disconnectedCount++;
-                break;
-
-            default:
-                errorCount++;
-                break;
+            }
         }
     }
 }
+catch (Exception ex)
+{
+    WriteLine($"TEST EXCEPTION: {ex}");
+}
 finally
 {
-    Console.WriteLine();
-    Console.WriteLine("STOPPING CORE...");
+    WriteLine("STOPPING CLIENT...");
 
     try
     {
-        client.Stop();
+        stopResult = await client.StopAsync();
 
-        Console.WriteLine(
-            $"CLIENT STATE: {client.State}");
+        WriteLine($"STOP RESULT: {stopResult}");
+        WriteLine($"CLIENT STATE: {client.State}");
     }
     catch (Exception ex)
     {
-        Console.WriteLine(
-            $"STOP EXCEPTION: {ex}");
+        WriteLine($"STOP EXCEPTION: {ex}");
     }
+
+    // Подписки освобождаются после завершения Rx.
+    valuesSubscription?.Dispose();
+    statusesSubscription?.Dispose();
 }
 
-Console.WriteLine();
-Console.WriteLine(
-    "======================================");
+WriteLine("");
+WriteLine("======================================");
+WriteLine("TEST SUMMARY");
+WriteLine("======================================");
 
-Console.WriteLine("TEST SUMMARY");
+WriteLine($"Start: {startResult}");
+WriteLine($"Stop: {stopResult}");
+WriteLine($"Final state: {client.State}");
 
-Console.WriteLine(
-    "======================================");
+WriteLine($"Rx value events: {rxValueCount}");
+WriteLine($"Rx status events: {rxStatusCount}");
 
-Console.WriteLine($"Snapshot OK: {okCount}");
-Console.WriteLine($"NoData: {noDataCount}");
-Console.WriteLine($"Disconnected: {disconnectedCount}");
-Console.WriteLine($"Errors: {errorCount}");
+WriteLine($"Snapshot Ok: {snapshotOkCount}");
+WriteLine($"Snapshot NoData: {snapshotNoDataCount}");
+WriteLine($"Snapshot Disconnected: {snapshotDisconnectedCount}");
+WriteLine($"Snapshot Errors: {snapshotErrorCount}");
 
-Console.WriteLine();
-Console.WriteLine("TEST COMPLETED");
+SnapshotStatus afterStop =
+    client.GetSnapshot(out var afterStopValues);
 
-/// <summary>
-/// Передаёт временно закреплённый клиентский массив
-/// через утверждённый контракт ICore.
-///
-/// Указатель действует только внутри вызова.
-/// </summary>
-static unsafe SnapshotStatus ReadSnapshot(
-    ICore core,
-    float[] buffer)
+WriteLine($"Snapshot after Stop: {afterStop}");
+WriteLine($"Values after Stop: {afterStopValues.Length}");
+
+CoreLinkResult repeatedStop =
+    await client.StopAsync();
+
+WriteLine($"Repeated Stop: {repeatedStop}");
+
+WriteLine("");
+WriteLine("TEST COMPLETED");
+
+void WriteLine(string message)
 {
-    fixed (float* pointer = buffer)
+    lock (outputLock)
     {
-        return core.GetSnapshot(
-            pointer,
-            buffer.Length);
+        Console.WriteLine(
+            $"[{DateTime.Now:HH:mm:ss.fff}] {message}");
     }
 }

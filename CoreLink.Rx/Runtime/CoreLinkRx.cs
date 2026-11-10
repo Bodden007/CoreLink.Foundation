@@ -10,8 +10,8 @@ namespace CoreLink.Rx.Runtime;
 
 /// <summary>
 /// Получает готовый snapshot через Client.
-/// Память принадлежит Client и должна оставаться
-/// стабильной на время синхронной обработки.
+/// Память принадлежит Client и остаётся стабильной
+/// на время синхронной обработки.
 /// </summary>
 public delegate SnapshotStatus SnapshotReader(
     out ReadOnlyMemory<float> values);
@@ -28,7 +28,7 @@ public readonly record struct RxValue(
 
 /// <summary>
 /// Последовательно получает snapshot через Client,
-/// сравнивает значения и публикует только изменения.
+/// сравнивает значения и публикует изменения.
 ///
 /// Не выполняет Modbus polling и не управляет Core.
 /// Ошибки локализуются внутри компонента.
@@ -36,12 +36,12 @@ public readonly record struct RxValue(
 public sealed class CoreLinkRx : IAsyncDisposable
 {
     private const int DefaultUnitSystemId = 1;
-
     private const string UnknownUnit = "—";
 
     private readonly SnapshotReader? _snapshotReader;
     private readonly RxValueDefinition[] _definitions;
     private readonly int? _unitSystemValueId;
+    private readonly HashSet<int> _supportedUnitSystems;
     private readonly int _intervalMs;
     private readonly float[] _buffer;
     private readonly bool _configurationValid;
@@ -80,12 +80,17 @@ public sealed class CoreLinkRx : IAsyncDisposable
         SnapshotReader snapshotReader,
         IReadOnlyList<RxValueDefinition> definitions,
         int? unitSystemValueId,
+        IReadOnlyCollection<int> supportedUnitSystemIds,
         int intervalMs)
     {
         _snapshotReader = snapshotReader;
         _definitions = definitions?.ToArray() ?? [];
         _unitSystemValueId = unitSystemValueId;
         _intervalMs = intervalMs;
+
+        _supportedUnitSystems = supportedUnitSystemIds is null
+            ? []
+            : new HashSet<int>(supportedUnitSystemIds);
 
         _buffer = new float[_definitions.Length];
 
@@ -99,8 +104,7 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Проверяет параметры до запуска рабочего цикла.
-    /// При ошибке запрещает Start и сохраняет диагностику.
+    /// Проверяет конфигурацию до запуска рабочего цикла.
     /// </summary>
     private bool ValidateConfiguration()
     {
@@ -108,10 +112,25 @@ public sealed class CoreLinkRx : IAsyncDisposable
             return ConfigurationError("SnapshotReader is null.");
 
         if (_intervalMs <= 0)
-            return ConfigurationError("Rx interval must be positive.");
+            return ConfigurationError(
+                "Rx interval must be positive.");
 
         if (_definitions.Length == 0)
-            return ConfigurationError("Rx definitions are empty.");
+            return ConfigurationError(
+                "Rx definitions are empty.");
+
+        if (_supportedUnitSystems.Count == 0)
+            return ConfigurationError(
+                "Supported unit systems are empty.");
+
+        foreach (int systemId in _supportedUnitSystems)
+        {
+            if (systemId <= 0)
+            {
+                return ConfigurationError(
+                    $"Invalid unit system ID: {systemId}.");
+            }
+        }
 
         if (_unitSystemValueId is int valueId &&
             (uint)valueId >= (uint)_definitions.Length)
@@ -120,15 +139,25 @@ public sealed class CoreLinkRx : IAsyncDisposable
                 "Invalid Measurme ValueId.");
         }
 
-        var names = new HashSet<string>(StringComparer.Ordinal);
+        if (_unitSystemValueId is null &&
+            !_supportedUnitSystems.Contains(DefaultUnitSystemId))
+        {
+            return ConfigurationError(
+                "Default unit system 1 is not registered.");
+        }
+
+        var names = new HashSet<string>(
+            StringComparer.Ordinal);
 
         foreach (RxValueDefinition definition in _definitions)
         {
             if (definition is null)
-                return ConfigurationError("Rx definition is null.");
+                return ConfigurationError(
+                    "Rx definition is null.");
 
             if (string.IsNullOrWhiteSpace(definition.Name))
-                return ConfigurationError("Rx value name is empty.");
+                return ConfigurationError(
+                    "Rx value name is empty.");
 
             if (!names.Add(definition.Name))
             {
@@ -140,6 +169,23 @@ public sealed class CoreLinkRx : IAsyncDisposable
             {
                 return ConfigurationError(
                     $"Units are null: {definition.Name}");
+            }
+
+            foreach (var pair in definition.Units)
+            {
+                if (!_supportedUnitSystems.Contains(pair.Key))
+                {
+                    return ConfigurationError(
+                        $"Unregistered unit system {pair.Key}: " +
+                        definition.Name);
+                }
+
+                if (string.IsNullOrWhiteSpace(pair.Value))
+                {
+                    return ConfigurationError(
+                        $"Invalid unit symbol: {definition.Name}, " +
+                        $"system {pair.Key}.");
+                }
             }
         }
 
@@ -154,8 +200,7 @@ public sealed class CoreLinkRx : IAsyncDisposable
 
     /// <summary>
     /// Запускает один последовательный рабочий цикл.
-    /// Повторный Start во время работы ничего не делает.
-    /// После Stop повторный запуск не допускается.
+    /// После Stop повторный запуск запрещён.
     /// </summary>
     public void Start()
     {
@@ -189,11 +234,9 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Запрашивает snapshot последовательно.
-    /// Следующая итерация начинается после обработки
-    /// предыдущей и выдерживания заданного интервала.
-    ///
-    /// Ошибка запроса не создаёт очередь повторов.
+    /// Получает snapshot и публикует изменения.
+    /// Следующий цикл начинается после обработки
+    /// предыдущего и заданной задержки.
     /// </summary>
     private async Task RunAsync(
         CancellationToken cancellationToken)
@@ -241,10 +284,9 @@ public sealed class CoreLinkRx : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    // TODO: Подключить штатное логирование
-                    // ошибок чтения и обработки snapshot.
-                    // Не маскировать ошибку под PLC Disconnected.
-                    ReportError("Rx processing failed.", ex);
+                    ReportError(
+                        "Rx processing failed.",
+                        ex);
                 }
 
                 await Task.Delay(
@@ -268,10 +310,12 @@ public sealed class CoreLinkRx : IAsyncDisposable
 
     /// <summary>
     /// Сравнивает значения с последним успешным snapshot.
-    /// Публикует только изменённые значения или единицы.
     ///
-    /// Без Measurme используется UA (1).
-    /// Существующий Measurme определяет систему из PLC.
+    /// 0: единицы отсутствуют, ошибки нет.
+    /// Известная система: обозначения из карты.
+    /// Неизвестная система: прочерк и диагностика.
+    ///
+    /// Публикует только изменение числа или единицы.
     /// </summary>
     private void ProcessValues(ReadOnlySpan<float> values)
     {
@@ -283,10 +327,10 @@ public sealed class CoreLinkRx : IAsyncDisposable
 
             nextUnitSystemId = GetUnitSystemId(rawUnitId);
 
-            if (nextUnitSystemId is not (1 or 2))
+            if (!IsValidUnitSystem(nextUnitSystemId))
             {
                 ReportUnitError(
-                    $"Invalid Measurme value: {rawUnitId}.");
+                    $"Unknown Measurme value: {rawUnitId}.");
             }
             else
             {
@@ -338,8 +382,18 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Проверяет числовой идентификатор PLC.
-    /// Неизвестные значения не подменяются системой 1.
+    /// 0 является допустимым специальным значением.
+    /// Остальные ID должны быть зарегистрированы.
+    /// </summary>
+    private bool IsValidUnitSystem(int? systemId)
+    {
+        return systemId is int id &&
+            (id == 0 || _supportedUnitSystems.Contains(id));
+    }
+
+    /// <summary>
+    /// Проверяет, что значение PLC представляет
+    /// целочисленный идентификатор системы.
     /// </summary>
     private static int? GetUnitSystemId(float value)
     {
@@ -355,31 +409,31 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Возвращает обозначение единицы.
+    /// Выбирает единицу параметра.
     ///
-    /// Отсутствующая единица имеет пустое обозначение.
-    /// Неизвестная система обозначается прочерком.
+    /// 0: пустая строка.
+    /// Известная система без единицы: пустая строка.
+    /// Неизвестная система: прочерк.
     /// </summary>
-    private static string GetUnit(
+    private string GetUnit(
         RxValueDefinition definition,
         int? systemId)
     {
-        if (systemId is not (1 or 2))
+        if (systemId == 0)
+            return string.Empty;
+
+        if (!IsValidUnitSystem(systemId))
             return UnknownUnit;
 
         return definition.Units.TryGetValue(
-            systemId.Value,
+            systemId!.Value,
             out string? unit)
             ? unit ?? string.Empty
             : string.Empty;
     }
 
     /// <summary>
-    /// Диагностирует изменение причины ошибки Unit.
-    /// Одинаковая ошибка не повторяется на каждом цикле.
-    ///
-    /// TODO: Передать событие UnitError
-    /// в централизованный логгер.
+    /// Ошибка логируется только при изменении причины.
     /// </summary>
     private void ReportUnitError(string message)
     {
@@ -397,9 +451,6 @@ public sealed class CoreLinkRx : IAsyncDisposable
 
     /// <summary>
     /// Фиксирует восстановление корректной системы.
-    ///
-    /// TODO: Передать событие восстановления Unit
-    /// в централизованный логгер.
     /// </summary>
     private void ClearUnitError()
     {
@@ -422,7 +473,6 @@ public sealed class CoreLinkRx : IAsyncDisposable
     /// <summary>
     /// Отменяет дальнейшие запросы и ожидает
     /// завершения рабочего цикла.
-    ///
     /// Конкурентные вызовы используют одну задачу.
     /// </summary>
     public Task StopAsync()
@@ -465,8 +515,7 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Однократно запускает полное освобождение Rx.
-    /// Конкурентные вызовы ожидают одну задачу.
+    /// Однократно запускает освобождение Rx.
     /// </summary>
     public ValueTask DisposeAsync()
     {
@@ -510,12 +559,7 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Временная диагностика.
-    /// Ошибки сохраняются в LastError и выводятся через Trace.
-    ///
-    /// TODO: Заменить Trace на штатный ILogger,
-    /// передаваемый инфраструктурой CoreLink.Client.
-    /// TODO: Согласовать уведомление Client о faulted Rx.
+    /// Сохраняет диагностику в LastError и Trace.
     /// </summary>
     private void ReportError(
         string message,
@@ -542,13 +586,12 @@ public sealed class CoreLinkRx : IAsyncDisposable
         }
         catch (Exception)
         {
-            // Ошибка внешнего TraceListener не должна
-            // нарушать работу реактивного слоя.
+            // Ошибки логирования не должны нарушать Rx.
         }
     }
 
     /// <summary>
-    /// Подписывает наблюдателя с изоляцией его ошибок.
+    /// Изолирует исключения пользовательских подписчиков.
     /// </summary>
     private IDisposable SubscribeSafely<T>(
         Subject<T> subject,
@@ -572,9 +615,8 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Защищает общий Subject от исключений подписчика.
     /// Неисправный подписчик отключается.
-    /// Остальные продолжают получать значения.
+    /// Остальные продолжают получать события.
     /// </summary>
     private sealed class GuardedObserver<T> :
         IObserver<T>, IDisposable
@@ -677,8 +719,7 @@ public sealed class CoreLinkRx : IAsyncDisposable
             }
             catch (Exception)
             {
-                // Диагностика не должна нарушать
-                // распространение событий.
+                // Не нарушаем распространение событий.
             }
         }
 

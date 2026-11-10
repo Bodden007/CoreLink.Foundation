@@ -14,9 +14,9 @@ namespace CoreLink.Maps.Maps;
 /// </summary>
 internal static class ConnectionMap
 {
-    public const string IpAddress = "192.168.0.10";
+    public const string IpAddress = "127.0.0.1";
 
-    public const ushort Port = 502;
+    public const ushort Port = 1502;
 
     public const byte UnitId = 1;
 

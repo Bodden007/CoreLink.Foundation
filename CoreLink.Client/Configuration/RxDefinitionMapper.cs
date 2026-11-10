@@ -1,16 +1,16 @@
+
 using CoreLink.Contracts.Maps;
 using CoreLink.Rx.Configuration;
 
 namespace CoreLink.Client.Configuration;
 
 /// <summary>
-/// Преобразует managed-карту в определения CoreLink.Rx.
+/// Преобразует managed-карту в определения Rx.
 ///
 /// Порядок значений сохраняется: ValueId == index.
-/// Сопоставление выполняется один раз при подготовке
-/// конфигурации, не в рабочем цикле Rx.
+/// Сопоставление выполняется один раз перед запуском.
 ///
-/// Не выполняет локализацию и пересчёт значений.
+/// Не выполняет локализацию или пересчёт значений.
 /// </summary>
 internal static class RxDefinitionMapper
 {
@@ -43,6 +43,31 @@ internal static class RxDefinitionMapper
             return false;
         }
 
+        if (map.SupportedUnitSystemIds is null ||
+            map.SupportedUnitSystemIds.Length == 0)
+        {
+            error = "Supported unit systems are empty.";
+            return false;
+        }
+
+        var supported = new HashSet<int>();
+
+        foreach (int id in map.SupportedUnitSystemIds)
+        {
+            if (id <= 0 || !supported.Add(id))
+            {
+                error = $"Invalid unit system ID: {id}.";
+                return false;
+            }
+        }
+
+        if (map.UnitSystemValueId is null &&
+            !supported.Contains(1))
+        {
+            error = "Default unit system 1 is not registered.";
+            return false;
+        }
+
         var result =
             new RxValueDefinition[map.Values.Length];
 
@@ -65,18 +90,35 @@ internal static class RxDefinitionMapper
                 return false;
             }
 
-            if (value.AmericanUnit is null ||
-                value.MetricUnit is null)
+            if (value.Units is null)
             {
-                error = $"Invalid units: {value.Name}.";
+                error = $"Units are null: {value.Name}.";
                 return false;
             }
 
-            var units = new Dictionary<int, string>(2)
+            var units = new Dictionary<int, string>(
+                value.Units.Count);
+
+            foreach (var pair in value.Units)
             {
-                [1] = value.AmericanUnit,
-                [2] = value.MetricUnit
-            };
+                if (!supported.Contains(pair.Key))
+                {
+                    error =
+                        $"Unregistered unit system " +
+                        $"{pair.Key}: {value.Name}.";
+                    return false;
+                }
+
+                if (string.IsNullOrWhiteSpace(pair.Value))
+                {
+                    error =
+                        $"Invalid unit symbol: " +
+                        $"{value.Name}, system {pair.Key}.";
+                    return false;
+                }
+
+                units.Add(pair.Key, pair.Value);
+            }
 
             result[i] = new RxValueDefinition(
                 value.Name,

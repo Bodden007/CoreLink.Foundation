@@ -6,14 +6,11 @@ using CoreLink.Maps.Maps;
 namespace CoreLink.Maps;
 
 /// <summary>
-/// Предоставляет конфигурации Core и Rx из единой
-/// физической карты регистров.
+/// Предоставляет Core и Rx проекции одной карты.
 ///
 /// Core получает бинарную карту v2.
-/// Rx получает managed-описания значений.
-///
-/// TODO: Согласовать общий контракт загрузки обеих
-/// проекций через IMapProvider перед интеграцией Client.
+/// Rx получает managed-описания значений
+/// и зарегистрированных систем единиц.
 /// </summary>
 public sealed class MapProvider : IMapProvider
 {
@@ -26,9 +23,7 @@ public sealed class MapProvider : IMapProvider
         var registers = RegisterMap.Registers;
 
         if (registers.Length == 0)
-        {
             return false;
-        }
 
         var map = new CoreLinkMap
         {
@@ -53,8 +48,6 @@ public sealed class MapProvider : IMapProvider
         }
         catch (Exception ex)
         {
-            // TODO: Передать ошибку кодирования карты
-            // в централизованный логгер.
             System.Diagnostics.Trace.TraceError(
                 $"Core map encoding failed: {ex}");
 
@@ -63,13 +56,8 @@ public sealed class MapProvider : IMapProvider
     }
 
     /// <summary>
-    /// Формирует managed-карту для реактивного слоя.
-    ///
-    /// Порядок значений соответствует RegisterMap.
-    /// ValueId равен индексу элемента.
-    ///
-    /// Интервал Rx берётся из конфигурации сборки.
-    /// Не создаёт Rx и не управляет его lifecycle.
+    /// Формирует Rx-карту.
+    /// ValueId соответствует индексу RegisterMap.
     /// </summary>
     public bool TryLoadRxMap(
         string mapId,
@@ -78,6 +66,7 @@ public sealed class MapProvider : IMapProvider
     {
         return RxMapBuilder.TryBuild(
             RegisterMap.Registers,
+            RegisterMap.SupportedUnitSystemIds,
             ConnectionMap.RxIntervalMs,
             out rxMap,
             out error);

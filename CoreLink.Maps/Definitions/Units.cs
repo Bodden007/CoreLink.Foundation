@@ -1,37 +1,31 @@
+
 namespace CoreLink.Maps.Definitions;
 
 /// <summary>
-/// Американская система единиц измерения.
-/// Значение None означает отсутствие единицы.
+/// Единица одного параметра в заданной системе PLC.
 /// </summary>
-public enum UA : byte
-{
-    None = 0,
-    PSI = 1
-}
+public readonly record struct UnitEntry(
+    int SystemId,
+    string Symbol);
 
 /// <summary>
-/// Метрическая система единиц измерения.
-/// Значение None означает отсутствие единицы.
+/// Набор единиц одного технологического параметра.
+///
+/// Отсутствие записи для зарегистрированной системы
+/// означает отсутствие обозначения, а не ошибку.
+///
+/// Числовых преобразований не выполняет.
 /// </summary>
-public enum EU : byte
+public readonly struct Units
 {
-    None = 0,
-    Bar = 1,
-    MPa = 2,
-    Atm = 3
-}
+    public IReadOnlyList<UnitEntry> Entries { get; }
 
-/// <summary>
-/// Единицы измерения одного технологического параметра.
-///
-/// American соответствует Measurme = 1.
-/// Metric соответствует Measurme = 2.
-///
-/// Отсутствующая структура или значение enum 0
-/// означает, что единица не задана.
-/// Числовые преобразования не выполняются.
-/// </summary>
-public readonly record struct Units(
-    UA American,
-    EU Metric);
+    public Units(params UnitEntry[] entries)
+    {
+        Entries = Array.AsReadOnly(
+            (UnitEntry[])(
+                entries ??
+                throw new ArgumentNullException(nameof(entries))
+            ).Clone());
+    }
+}

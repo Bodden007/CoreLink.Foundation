@@ -42,9 +42,7 @@ public sealed class CoreLinkClient
         get
         {
             lock (_lifecycleLock)
-            {
                 return _state;
-            }
         }
     }
 
@@ -53,9 +51,7 @@ public sealed class CoreLinkClient
         get
         {
             lock (_lifecycleLock)
-            {
                 return _coreMap;
-            }
         }
     }
 
@@ -68,9 +64,7 @@ public sealed class CoreLinkClient
         get
         {
             lock (_lifecycleLock)
-            {
                 return _rx?.Values;
-            }
         }
     }
 
@@ -82,9 +76,7 @@ public sealed class CoreLinkClient
         get
         {
             lock (_lifecycleLock)
-            {
                 return _rx?.Statuses;
-            }
         }
     }
 
@@ -165,9 +157,6 @@ public sealed class CoreLinkClient
                     return StartFailed(CoreLinkResult.BadConfig);
                 }
 
-                // Буферы выделяются однократно.
-                // Публичные запросы и Rx не используют
-                // общий изменяемый массив.
                 var coreBuffer =
                     new float[coreMap.BufferLength];
 
@@ -193,8 +182,6 @@ public sealed class CoreLinkClient
 
                 if (result != CoreLinkResult.Ok)
                 {
-                    // TODO: Уточнить гарантии освобождения
-                    // ресурсов после неуспешного Core.Start.
                     return StartFailed(result);
                 }
 
@@ -208,6 +195,7 @@ public sealed class CoreLinkClient
                     ReadRxSnapshot,
                     definitions,
                     rxMap.UnitSystemValueId,
+                    rxMap.SupportedUnitSystemIds,
                     rxMap.RxIntervalMs);
 
                 _rx = rx;
@@ -220,8 +208,6 @@ public sealed class CoreLinkClient
                     ReportError(
                         rx.LastError ?? "Rx start failed.");
 
-                    // TODO: Согласовать восстановление
-                    // после отказа запуска Rx.
                     _state = CoreLinkState.Faulted;
                     return CoreLinkResult.SessionError;
                 }
@@ -232,9 +218,6 @@ public sealed class CoreLinkClient
             {
                 ReportError("CoreLink start failed.", ex);
                 _state = CoreLinkState.Faulted;
-
-                // Ресурсы запущенной сессии
-                // освобождаются через StopAsync.
                 return CoreLinkResult.SessionError;
             }
         }
@@ -252,8 +235,6 @@ public sealed class CoreLinkClient
     /// Использует собственный буфер Client.
     /// Повторный вызов может изменить ранее
     /// возвращённый ReadOnlyMemory.
-    ///
-    /// Core не сохраняет указатель.
     /// </summary>
     public unsafe SnapshotStatus GetSnapshot(
         out ReadOnlyMemory<float> values)
@@ -289,9 +270,6 @@ public sealed class CoreLinkClient
             catch (Exception ex)
             {
                 ReportError("Snapshot read failed.", ex);
-
-                // TODO: Добавить отдельный SnapshotStatus
-                // для внутренних ошибок чтения.
                 return SnapshotStatus.BadBuffer;
             }
         }
@@ -301,12 +279,6 @@ public sealed class CoreLinkClient
     /// SnapshotReader, принадлежащий Rx.
     ///
     /// Использует отдельный постоянный буфер.
-    /// Новый массив на каждом цикле не создаётся.
-    ///
-    /// Rx выполняет запросы последовательно:
-    /// следующая запись в буфер произойдёт только
-    /// после синхронной обработки текущего snapshot.
-    ///
     /// Публичный GetSnapshot не изменяет этот буфер.
     /// </summary>
     private unsafe SnapshotStatus ReadRxSnapshot(
@@ -343,9 +315,6 @@ public sealed class CoreLinkClient
             catch (Exception ex)
             {
                 ReportError("Rx snapshot read failed.", ex);
-
-                // TODO: Уточнить статус внутренних
-                // ошибок получения snapshot.
                 return SnapshotStatus.BadBuffer;
             }
         }
@@ -354,11 +323,8 @@ public sealed class CoreLinkClient
     /// <summary>
     /// Основной механизм остановки.
     ///
-    /// Запрещает новые операции, завершает Rx
-    /// без удержания lifecycle lock,
-    /// затем останавливает Core.
-    ///
     /// Конкурентные вызовы получают одну задачу.
+    /// Сначала останавливается Rx, затем Core.
     /// </summary>
     public Task<CoreLinkResult> StopAsync()
     {
@@ -408,9 +374,7 @@ public sealed class CoreLinkClient
         if (!rxStopped)
         {
             lock (_lifecycleLock)
-            {
                 _state = CoreLinkState.Faulted;
-            }
 
             return CoreLinkResult.SessionError;
         }
@@ -444,8 +408,6 @@ public sealed class CoreLinkClient
                 _coreStarted = false;
             }
 
-            // Освобождение ссылок только после
-            // подтверждённого завершения Rx и Core.
             _rx = null;
             _rxBuffer = null;
             _coreBuffer = null;
@@ -459,9 +421,7 @@ public sealed class CoreLinkClient
 
     /// <summary>
     /// Синхронная обёртка для совместимости.
-    ///
-    /// Не вызывать непосредственно из обработчика Rx.
-    /// Для такого сценария использовать StopAsync.
+    /// Не вызывать из обработчика Rx.
     /// </summary>
     public void Stop()
     {
@@ -475,11 +435,6 @@ public sealed class CoreLinkClient
         }
     }
 
-    /// <summary>
-    /// Временная диагностика Client.
-    ///
-    /// TODO: Заменить Trace централизованным логгером.
-    /// </summary>
     private static void ReportError(
         string message,
         Exception? exception = null)
@@ -493,8 +448,7 @@ public sealed class CoreLinkClient
         }
         catch (Exception)
         {
-            // Ошибка диагностики не должна
-            // нарушать работу Client.
+            // Ошибки диагностики не должны нарушать Client.
         }
     }
 }

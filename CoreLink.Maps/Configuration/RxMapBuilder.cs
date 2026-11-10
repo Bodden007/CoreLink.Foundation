@@ -1,22 +1,20 @@
+
 using CoreLink.Contracts.Maps;
 using CoreLink.Maps.Definitions;
 
 namespace CoreLink.Maps.Configuration;
 
 /// <summary>
-/// Формирует managed-карту Rx из физических определений.
+/// Формирует managed-карту Rx.
 ///
-/// Поиск Measurme и преобразование единиц выполняются
-/// только при подготовке конфигурации.
-/// В рабочем цикле Rx строкового поиска нет.
-///
-/// Контракты RxMapConfiguration и RxMapValue
-/// принадлежат CoreLink.Contracts.
+/// Проверки конфигурации выполняются однократно.
+/// В рабочем цикле Rx строкового поиска имён нет.
 /// </summary>
 internal static class RxMapBuilder
 {
     public static bool TryBuild(
         PhysicalRegister[] registers,
+        IReadOnlyCollection<int> supportedUnitSystemIds,
         int rxIntervalMs,
         out RxMapConfiguration? result,
         out string? error)
@@ -36,6 +34,30 @@ internal static class RxMapBuilder
             return false;
         }
 
+        if (supportedUnitSystemIds is null ||
+            supportedUnitSystemIds.Count == 0)
+        {
+            error = "Supported unit systems are empty.";
+            return false;
+        }
+
+        var supported = new HashSet<int>();
+
+        foreach (int id in supportedUnitSystemIds)
+        {
+            if (id <= 0)
+            {
+                error = $"Invalid unit system ID: {id}.";
+                return false;
+            }
+
+            if (!supported.Add(id))
+            {
+                error = $"Duplicate unit system ID: {id}.";
+                return false;
+            }
+        }
+
         var values = new RxMapValue[registers.Length];
         var names = new HashSet<string>(StringComparer.Ordinal);
 
@@ -43,7 +65,7 @@ internal static class RxMapBuilder
 
         for (int i = 0; i < registers.Length; i++)
         {
-            var register = registers[i];
+            PhysicalRegister register = registers[i];
 
             if (string.IsNullOrWhiteSpace(register.Name))
             {
@@ -58,35 +80,65 @@ internal static class RxMapBuilder
             }
 
             if (register.Name == "Measurme")
-            {
                 unitSystemValueId = i;
-            }
 
-            if (!UnitSymbols.TryGet(
-                    register.Units.American,
-                    out string americanUnit))
-            {
-                error = $"Invalid UA unit: {register.Name}.";
-                return false;
-            }
+            var units = new Dictionary<int, string>();
 
-            if (!UnitSymbols.TryGet(
-                    register.Units.Metric,
-                    out string metricUnit))
+            IReadOnlyList<UnitEntry>? entries =
+                register.Units.Entries;
+
+            if (entries is not null)
             {
-                error = $"Invalid EU unit: {register.Name}.";
-                return false;
+                foreach (UnitEntry entry in entries)
+                {
+                    if (!supported.Contains(entry.SystemId))
+                    {
+                        error =
+                            $"Unregistered unit system " +
+                            $"{entry.SystemId}: {register.Name}.";
+                        return false;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(entry.Symbol))
+                    {
+                        error =
+                            $"Empty unit symbol: " +
+                            $"{register.Name}, system " +
+                            $"{entry.SystemId}.";
+                        return false;
+                    }
+
+                    if (!units.TryAdd(
+                            entry.SystemId,
+                            entry.Symbol))
+                    {
+                        error =
+                            $"Duplicate unit system " +
+                            $"{entry.SystemId}: {register.Name}.";
+                        return false;
+                    }
+                }
             }
 
             values[i] = new RxMapValue(
                 register.Name,
-                americanUnit,
-                metricUnit);
+                new System.Collections.ObjectModel
+                    .ReadOnlyDictionary<int, string>(units));
+        }
+
+        if (unitSystemValueId is null &&
+            !supported.Contains(1))
+        {
+            error =
+                "Default unit system 1 is not registered.";
+            return false;
         }
 
         result = new RxMapConfiguration
         {
             Values = values,
+            SupportedUnitSystemIds =
+                supported.OrderBy(id => id).ToArray(),
             UnitSystemValueId = unitSystemValueId,
             RxIntervalMs = rxIntervalMs
         };
