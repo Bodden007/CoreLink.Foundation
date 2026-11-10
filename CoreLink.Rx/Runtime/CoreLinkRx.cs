@@ -1,4 +1,7 @@
 
+using System.Diagnostics;
+using System.Reactive.Disposables;
+using System.Reactive.Linq;
 using System.Reactive.Subjects;
 using CoreLink.Contracts.Core;
 using CoreLink.Rx.Configuration;
@@ -6,16 +9,16 @@ using CoreLink.Rx.Configuration;
 namespace CoreLink.Rx.Runtime;
 
 /// <summary>
-/// Получает snapshot через Client.
-/// Переданная память принадлежит Client и используется
-/// только для синхронного копирования.
+/// Получает готовый snapshot через Client.
+/// Память принадлежит Client и должна оставаться
+/// стабильной на время синхронной обработки.
 /// </summary>
 public delegate SnapshotStatus SnapshotReader(
     out ReadOnlyMemory<float> values);
 
 /// <summary>
-/// Готовое значение для подписчиков.
-/// Не содержит ссылок на рабочий буфер Rx.
+/// Значение для подписчика.
+/// Не содержит ссылок на рабочие массивы.
 /// </summary>
 public readonly record struct RxValue(
     int ValueId,
@@ -24,40 +27,49 @@ public readonly record struct RxValue(
     string? Unit);
 
 /// <summary>
-/// Получает готовые значения через Client, сравнивает
-/// с предыдущим состоянием и публикует только изменения.
+/// Последовательно получает snapshot через Client,
+/// сравнивает значения и публикует только изменения.
 ///
-/// Не управляет Core, Transport и Modbus polling.
+/// Не выполняет Modbus polling и не управляет Core.
+/// Ошибки локализуются внутри компонента.
 /// </summary>
 public sealed class CoreLinkRx : IAsyncDisposable
 {
-    private readonly SnapshotReader _snapshotReader;
+    private readonly SnapshotReader? _snapshotReader;
     private readonly RxValueDefinition[] _definitions;
-
     private readonly int _unitSystemValueId;
     private readonly int _intervalMs;
-
     private readonly float[] _buffer;
+    private readonly bool _configurationValid;
 
     private readonly Subject<RxValue> _values = new();
     private readonly Subject<SnapshotStatus> _statuses = new();
+
+    private readonly IObservable<RxValue> _safeValues;
+    private readonly IObservable<SnapshotStatus> _safeStatuses;
 
     private readonly object _lifecycleLock = new();
 
     private CancellationTokenSource? _cts;
     private Task? _task;
     private Task? _stopTask;
+    private Task? _disposeTask;
 
     private int? _unitSystemId;
+    private SnapshotStatus? _lastStatus;
+
     private bool _hasData;
     private bool _stopped;
     private bool _disposed;
+    private bool _faulted;
+    private string? _lastError;
 
-    public IObservable<RxValue> Values => _values;
-
-    public IObservable<SnapshotStatus> Statuses => _statuses;
+    public IObservable<RxValue> Values => _safeValues;
+    public IObservable<SnapshotStatus> Statuses => _safeStatuses;
 
     public bool HasData => Volatile.Read(ref _hasData);
+    public bool IsFaulted => Volatile.Read(ref _faulted);
+    public string? LastError => Volatile.Read(ref _lastError);
 
     public CoreLinkRx(
         SnapshotReader snapshotReader,
@@ -65,86 +77,111 @@ public sealed class CoreLinkRx : IAsyncDisposable
         int unitSystemValueId,
         int intervalMs)
     {
-        ArgumentNullException.ThrowIfNull(snapshotReader);
-        ArgumentNullException.ThrowIfNull(definitions);
-
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(
-            intervalMs);
-
-        if (definitions.Count == 0)
-        {
-            throw new ArgumentException(
-                "Rx definitions are empty.",
-                nameof(definitions));
-        }
-
-        if ((uint)unitSystemValueId >=
-            (uint)definitions.Count)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(unitSystemValueId));
-        }
-
-        _definitions = definitions.ToArray();
-
-        if (_definitions.Any(x => x is null))
-        {
-            throw new ArgumentException(
-                "Rx definitions contain null.",
-                nameof(definitions));
-        }
-
-        if (_definitions.Select(x => x.Name)
-            .Distinct(StringComparer.Ordinal)
-            .Count() != _definitions.Length)
-        {
-            throw new ArgumentException(
-                "Rx definitions contain duplicate names.",
-                nameof(definitions));
-        }
-
         _snapshotReader = snapshotReader;
+        _definitions = definitions?.ToArray() ?? [];
         _unitSystemValueId = unitSystemValueId;
         _intervalMs = intervalMs;
 
-        // Единственный рабочий буфер Rx.
         _buffer = new float[_definitions.Length];
+
+        _safeValues = Observable.Create<RxValue>(
+            observer => SubscribeSafely(_values, observer));
+
+        _safeStatuses = Observable.Create<SnapshotStatus>(
+            observer => SubscribeSafely(_statuses, observer));
+
+        _configurationValid = ValidateConfiguration();
     }
 
     /// <summary>
-    /// Запускает один последовательный цикл.
-    /// Повторный запуск после остановки запрещён.
+    /// Проверяет параметры до запуска рабочего цикла.
+    /// При ошибке запрещает Start и сохраняет диагностику.
+    /// </summary>
+    private bool ValidateConfiguration()
+    {
+        if (_snapshotReader is null)
+            return ConfigurationError("SnapshotReader is null.");
+
+        if (_intervalMs <= 0)
+            return ConfigurationError("Rx interval must be positive.");
+
+        if (_definitions.Length == 0)
+            return ConfigurationError("Rx definitions are empty.");
+
+        if ((uint)_unitSystemValueId >= (uint)_definitions.Length)
+            return ConfigurationError("Invalid unit system ValueId.");
+
+        var names = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (RxValueDefinition definition in _definitions)
+        {
+            if (definition is null)
+                return ConfigurationError("Rx definition is null.");
+
+            if (string.IsNullOrWhiteSpace(definition.Name))
+                return ConfigurationError("Rx value name is empty.");
+
+            if (!names.Add(definition.Name))
+                return ConfigurationError(
+                    $"Duplicate Rx value name: {definition.Name}");
+
+            if (definition.Units is null)
+                return ConfigurationError(
+                    $"Units are null: {definition.Name}");
+        }
+
+        return true;
+    }
+
+    private bool ConfigurationError(string message)
+    {
+        ReportError(message, faulted: true);
+        return false;
+    }
+
+    /// <summary>
+    /// Запускает один последовательный рабочий цикл.
+    /// Повторный Start во время работы ничего не делает.
+    /// После Stop повторный запуск не допускается.
     /// </summary>
     public void Start()
     {
         lock (_lifecycleLock)
         {
-            ObjectDisposedException.ThrowIf(
-                _disposed, this);
-
-            if (_stopped)
-            {
-                throw new InvalidOperationException(
-                    "CoreLinkRx has been stopped.");
-            }
+            if (!_configurationValid || _disposed || _stopped)
+                return;
 
             if (_task is not null)
                 return;
 
-            _cts = new CancellationTokenSource();
+            try
+            {
+                _cts = new CancellationTokenSource();
+                CancellationToken token = _cts.Token;
 
-            CancellationToken token = _cts.Token;
+                _task = Task.Run(() => RunAsync(token));
+            }
+            catch (Exception ex)
+            {
+                ReportError(
+                    "Failed to start CoreLinkRx.",
+                    ex,
+                    faulted: true);
 
-            _task = Task.Run(
-                () => RunAsync(token));
+                _cts?.Dispose();
+                _cts = null;
+                _stopped = true;
+            }
         }
     }
 
     /// <summary>
-    /// Последовательно получает и обрабатывает snapshot.
+    /// Запрашивает snapshot последовательно.
+    /// Следующая итерация начинается после обработки
+    /// предыдущей и выдерживания заданного интервала.
     ///
-    /// После завершения обработки выдерживает интервал.
-    /// Очередь ожидающих запросов не создаётся.
+    /// Ошибка запроса не создаёт очередь повторов
+    /// и не останавливает остальные компоненты.
     /// </summary>
     private async Task RunAsync(
         CancellationToken cancellationToken)
@@ -153,27 +190,46 @@ public sealed class CoreLinkRx : IAsyncDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                SnapshotStatus status =
-                    _snapshotReader(out var values);
-
-                if (status == SnapshotStatus.Ok)
+                try
                 {
-                    if (values.Length != _buffer.Length)
+                    SnapshotStatus status =
+                        _snapshotReader!(out var values);
+
+                    if (status == SnapshotStatus.Ok)
                     {
-                        status = SnapshotStatus.BadBuffer;
+                        if (values.Length != _buffer.Length)
+                        {
+                            status = SnapshotStatus.BadBuffer;
+                        }
+                        else
+                        {
+                            ProcessValues(values.Span);
+                        }
                     }
-                    else
+
+                    if (_lastStatus != status)
                     {
-                        ProcessValues(values.Span);
+                        _lastStatus = status;
+                        _statuses.OnNext(status);
+
+                        if (status == SnapshotStatus.BadBuffer)
+                        {
+                            ReportError(
+                                "Snapshot buffer length mismatch.");
+                        }
                     }
                 }
-
-                _statuses.OnNext(status);
+                catch (Exception ex)
+                {
+                    // TODO: Подключить штатное логирование
+                    // ошибок чтения и обработки snapshot.
+                    // Не маскировать ошибку под PLC Disconnected.
+                    ReportError("Rx processing failed.", ex);
+                }
 
                 await Task.Delay(
                     _intervalMs,
-                    cancellationToken)
-                    .ConfigureAwait(false);
+                    cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -181,16 +237,19 @@ public sealed class CoreLinkRx : IAsyncDisposable
         {
             // Штатная остановка.
         }
+        catch (Exception ex)
+        {
+            ReportError(
+                "CoreLinkRx worker terminated.",
+                ex,
+                faulted: true);
+        }
     }
 
     /// <summary>
-    /// Сравнивает новый snapshot с рабочим буфером Rx.
-    ///
-    /// Публикует только значения, которые изменились,
-    /// либо значения с изменившейся единицей измерения.
-    ///
+    /// Сравнивает значения с последним успешным snapshot.
+    /// Публикует только изменённые значения или единицы.
     /// Первый успешный snapshot публикуется полностью.
-    /// Новые рабочие массивы не создаются.
     /// </summary>
     private void ProcessValues(ReadOnlySpan<float> values)
     {
@@ -204,35 +263,25 @@ public sealed class CoreLinkRx : IAsyncDisposable
             float newValue = values[i];
             float oldValue = _buffer[i];
 
-            RxValueDefinition definition =
-                _definitions[i];
+            RxValueDefinition definition = _definitions[i];
 
-            string? newUnit = GetUnit(
-                definition,
-                nextUnitSystemId);
+            string? newUnit =
+                GetUnit(definition, nextUnitSystemId);
 
-            string? oldUnit = GetUnit(
-                definition,
-                _unitSystemId);
+            string? oldUnit =
+                GetUnit(definition, _unitSystemId);
 
-            bool valueChanged =
-                !newValue.Equals(oldValue);
+            bool valueChanged = !newValue.Equals(oldValue);
 
-            bool unitChanged =
-                !string.Equals(
-                    newUnit,
-                    oldUnit,
-                    StringComparison.Ordinal);
+            bool unitChanged = !string.Equals(
+                newUnit,
+                oldUnit,
+                StringComparison.Ordinal);
 
-            // Обновляем собственный буфер.
             _buffer[i] = newValue;
 
-            if (!firstSnapshot &&
-                !valueChanged &&
-                !unitChanged)
-            {
+            if (!firstSnapshot && !valueChanged && !unitChanged)
                 continue;
-            }
 
             _values.OnNext(new RxValue(
                 i,
@@ -242,17 +291,13 @@ public sealed class CoreLinkRx : IAsyncDisposable
         }
 
         _unitSystemId = nextUnitSystemId;
-
-        Volatile.Write(
-            ref _hasData,
-            true);
+        Volatile.Write(ref _hasData, true);
     }
 
     /// <summary>
-    /// Извлекает общий идентификатор системы единиц.
-    ///
-    /// Некорректное или неизвестное число
-    /// не подменяется системой по умолчанию.
+    /// Получает общий идентификатор системы единиц PLC.
+    /// Неизвестные значения не заменяются системой
+    /// по умолчанию.
     /// </summary>
     private static int? GetUnitSystemId(float value)
     {
@@ -267,12 +312,6 @@ public sealed class CoreLinkRx : IAsyncDisposable
         return (int)value;
     }
 
-    /// <summary>
-    /// Получает обозначение единицы измерения
-    /// для конкретного параметра и системы.
-    ///
-    /// Не выполняет физического пересчёта.
-    /// </summary>
     private static string? GetUnit(
         RxValueDefinition definition,
         int? systemId)
@@ -288,8 +327,10 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Прекращает новые запросы и ожидает
-    /// завершения активного рабочего цикла.
+    /// Отменяет дальнейшие запросы и ожидает
+    /// завершения рабочего цикла.
+    ///
+    /// Конкурентные вызовы используют одну задачу.
     /// </summary>
     public Task StopAsync()
     {
@@ -301,28 +342,28 @@ public sealed class CoreLinkRx : IAsyncDisposable
             _stopped = true;
 
             if (_cts is null || _task is null)
-            {
-                _stopTask = Task.CompletedTask;
-                return _stopTask;
-            }
+                return _stopTask = Task.CompletedTask;
 
             _cts.Cancel();
 
-            _stopTask = FinishStopAsync(
-                _task,
-                _cts);
-
-            return _stopTask;
+            return _stopTask = FinishStopAsync(_task, _cts);
         }
     }
 
-    private static async Task FinishStopAsync(
+    private async Task FinishStopAsync(
         Task task,
         CancellationTokenSource cts)
     {
         try
         {
             await task.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ReportError(
+                "CoreLinkRx stop failed.",
+                ex,
+                faulted: true);
         }
         finally
         {
@@ -331,27 +372,227 @@ public sealed class CoreLinkRx : IAsyncDisposable
     }
 
     /// <summary>
-    /// Завершает цикл и освобождает подписки.
-    ///
-    /// Client должен дождаться завершения Rx
-    /// перед остановкой Core.
+    /// Однократно запускает полное освобождение Rx.
+    /// Конкурентные вызовы ожидают одну задачу.
     /// </summary>
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_disposeTask is null)
+            {
+                _stopped = true;
+                _disposeTask = Task.Run(DisposeCoreAsync);
+            }
+
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
     {
         await StopAsync().ConfigureAwait(false);
 
         lock (_lifecycleLock)
         {
-            if (_disposed)
-                return;
-
             _disposed = true;
         }
 
-        _values.OnCompleted();
-        _statuses.OnCompleted();
+        try
+        {
+            _values.OnCompleted();
+            _statuses.OnCompleted();
+        }
+        catch (Exception ex)
+        {
+            ReportError(
+                "CoreLinkRx completion failed.",
+                ex);
+        }
+        finally
+        {
+            _values.Dispose();
+            _statuses.Dispose();
+        }
+    }
 
-        _values.Dispose();
-        _statuses.Dispose();
+    /// <summary>
+    /// Временная диагностика.
+    /// Ошибки сохраняются в LastError и выводятся через Trace.
+    ///
+    /// TODO: Заменить Trace на штатный ILogger,
+    /// передаваемый инфраструктурой CoreLink.Client.
+    /// TODO: Согласовать уведомление Client о faulted Rx.
+    /// </summary>
+    private void ReportError(
+        string message,
+        Exception? exception = null,
+        bool faulted = false)
+    {
+        string diagnostic = exception is null
+            ? message
+            : $"{message} {exception}";
+
+        Volatile.Write(ref _lastError, diagnostic);
+
+        if (faulted)
+            Volatile.Write(ref _faulted, true);
+
+        WriteDiagnostic(diagnostic);
+    }
+
+    private static void WriteDiagnostic(string message)
+    {
+        try
+        {
+            Trace.TraceError(message);
+        }
+        catch (Exception)
+        {
+            // Ошибка внешнего TraceListener не должна
+            // нарушать работу реактивного слоя.
+        }
+    }
+
+    /// <summary>
+    /// Подписывает наблюдателя с изоляцией его ошибок.
+    /// </summary>
+    private IDisposable SubscribeSafely<T>(
+        Subject<T> subject,
+        IObserver<T> observer)
+    {
+        var guarded = new GuardedObserver<T>(
+            observer,
+            message => ReportError(message));
+
+        try
+        {
+            guarded.SetSubscription(subject.Subscribe(guarded));
+        }
+        catch (Exception ex)
+        {
+            ReportError("Rx subscription failed.", ex);
+            guarded.Dispose();
+        }
+
+        return guarded;
+    }
+
+    /// <summary>
+    /// Защищает общий Subject от исключений подписчика.
+    /// Неисправный подписчик отключается.
+    /// Остальные продолжают получать значения.
+    /// </summary>
+    private sealed class GuardedObserver<T> :
+        IObserver<T>, IDisposable
+    {
+        private readonly IObserver<T> _observer;
+        private readonly Action<string> _reportError;
+
+        private readonly SingleAssignmentDisposable
+            _subscription = new();
+
+        private int _terminated;
+
+        public GuardedObserver(
+            IObserver<T> observer,
+            Action<string> reportError)
+        {
+            _observer = observer;
+            _reportError = reportError;
+        }
+
+        public void SetSubscription(IDisposable subscription)
+        {
+            _subscription.Disposable = subscription;
+        }
+
+        public void OnNext(T value)
+        {
+            if (Volatile.Read(ref _terminated) != 0)
+                return;
+
+            try
+            {
+                _observer.OnNext(value);
+            }
+            catch (Exception ex)
+            {
+                Detach(ex);
+            }
+        }
+
+        public void OnError(Exception error)
+        {
+            if (Interlocked.Exchange(ref _terminated, 1) != 0)
+                return;
+
+            try
+            {
+                _observer.OnError(error);
+            }
+            catch (Exception ex)
+            {
+                Report(ex);
+            }
+            finally
+            {
+                _subscription.Dispose();
+            }
+        }
+
+        public void OnCompleted()
+        {
+            if (Interlocked.Exchange(ref _terminated, 1) != 0)
+                return;
+
+            try
+            {
+                _observer.OnCompleted();
+            }
+            catch (Exception ex)
+            {
+                Report(ex);
+            }
+            finally
+            {
+                _subscription.Dispose();
+            }
+        }
+
+        private void Detach(Exception exception)
+        {
+            if (Interlocked.Exchange(ref _terminated, 1) != 0)
+                return;
+
+            try
+            {
+                Report(exception);
+            }
+            finally
+            {
+                _subscription.Dispose();
+            }
+        }
+
+        private void Report(Exception exception)
+        {
+            try
+            {
+                _reportError(
+                    $"Rx subscriber failed: {exception}");
+            }
+            catch (Exception)
+            {
+                // Диагностика не должна нарушать
+                // распространение событий.
+            }
+        }
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _terminated, 1);
+            _subscription.Dispose();
+        }
     }
 }
