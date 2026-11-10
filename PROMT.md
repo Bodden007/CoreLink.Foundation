@@ -117,12 +117,12 @@ PLC → Transport Polling → ushort[] → Core Decode → Internal Snapshot
 ### Запрос Client / Rx
 
 ```text
-Client periodic request → ICore.GetSnapshot(pointer, length)
+Rx request → Client → ICore.GetSnapshot(pointer, length)
                        → копирование готового Core snapshot
                        → Client float[] → Rx → HMI
 ```
 
-- Текущий предусмотренный интервал получения snapshot со стороны Client/Rx — 500 мс; не путать с `PollIntervalMs` карты.
+- Время запроса snapshot определяет Rx по готовности принять данные. У Client нет собственного периодического цикла чтения; 500 мс — только ранее использованный тестовый ориентир для Rx, не норматив и не `PollIntervalMs` карты.
 - `GetSnapshot()` **не инициирует Modbus-запрос**, не меняет частоту polling и не ждёт сеть.
 - Rx не работает с указателями и не управляет Transport.
 - В текущем `CoreLink.Client` ещё нет получения snapshot. TestHost вызывает `ICore.GetSnapshot` напрямую через адаптер, а не через Client. Планируемая интеграция — запрос Rx → Client → ICore; Client передаёт Rx snapshot/status.
