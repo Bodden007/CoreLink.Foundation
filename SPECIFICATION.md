@@ -30,7 +30,7 @@ Modbus TCP → PLC
 | Проект | Ответственность | Не должен делать |
 | --- | --- | --- |
 | Contracts | API, карты, статусы | TCP и UI |
-| Maps | физическая карта, Core v2 и managed Rx-карта | PLC I/O |
+| Maps | физическая карта, Core v3 и managed Rx-карта | PLC I/O |
 | Client | публичная точка, lifecycle, буферы, Rx | собственный Modbus polling |
 | Adapter.CSharp | реализация интерфейса ICore над Core | самостоятельные карты и polling |
 | Core | декодирование Word/Float32, snapshot, адресные запросы | Rx и UI |
@@ -45,7 +45,7 @@ Modbus TCP → PLC
 
 ### 3.1 Реально прочитанный default branch на 11.11.2026
 
-`ICore`: `Start(CoreMap)`, `Stop()`, `GetSnapshot(float*, int)`, событие `StatusChanged`.
+`ICore`: `Start(CoreMap)`, `Stop()`, `GetSnapshot(float*, int)`, `ReadAsync(IReadOnlyList<int>)`, событие `StatusChanged`.
 
 `CoreLinkClient`: `Start(string mapId)`, `GetSnapshot(out ReadOnlyMemory<float>)`, `StopAsync()`, `Stop()`, свойства `State`, `CoreMap`, `Values`, `Statuses`.
 
@@ -73,7 +73,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 
 ## 4. Polling, Dispatcher и Rx
 
-- Polling: последовательный FC04 Input Registers с интервалом `PollIntervalMs` из карты. Циклы не должны бесконечно накапливаться.
+- Polling: последовательный FC03 Holding Registers или FC04 Input Registers по `PollFunctionCode` из карты с интервалом `PollIntervalMs`. Циклы не должны бесконечно накапливаться.
 - Dispatcher: приоритетная запись, затем штатный polling, затем адресный Read; в коде предусмотрена защита polling от полного голодания при потоке Write. Приоритет записи при общей сессии требует интеграционного теста.
 - Rx: отдельный `RxIntervalMs` и готовый snapshot через Client. Значение публикуется, если изменилось число или отображаемая единица. Hot stream, без гарантированного replay.
 - Snapshot: пока нет первого успеха — `NoData`; при потере актуальности — `Disconnected`; **не** выдавать старый массив как новые данные с успешным статусом.
@@ -83,7 +83,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 
 `ValueId == index` в `RegisterMap`. Не равен Modbus-адресу.
 
-`CoreMap` binary v2: Little Endian; заголовок 33 байта; запись — `ushort Address` и `byte Type` (3 байта). `BufferLength` — число декодированных значений.
+`CoreMap` binary v3: Little Endian; заголовок 34 байта; запись — `ushort Address` и `byte Type` (3 байта). `BufferLength` — число декодированных значений.
 
 Подтверждённые типы: `Word`, `Float` (IEEE 754 Float32 из двух 16-битных регистров). Порядок слов/байтов задаётся картой; в испытаниях проверен текущий порядок и контрольные значения, **не все перестановки**.
 
@@ -110,7 +110,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 | Build решения (8 проектов net10.0) | Успешно |
 | FC04 Read invariant | 5/5 сценариев, 120/120 snapshot, 132/132 инвариантов |
 | Stable stress 60 с: polling 500 мс, snapshot 500 мс, Read 700 мс, write 2100 мс | snapshot 120/120, Read 85/85, Write/readback 28/28, 0 инвариантов нарушено |
-| Автоматический fault-cycle | 10 с ONLINE, 10 с OFFLINE, 10 с RECOVERY, 10 с HANG FC04 при открытом TCP, 10 с RECOVERY |
+| Автоматический fault-cycle | 10 с ONLINE, 10 с OFFLINE, 10 с RECOVERY, 10 с HANG FC03/FC04 при открытом TCP, 10 с RECOVERY |
 | Fault stress 60 с | 177/177 физически начатых запросов завершены, 10 timeout / 10 завершённых старых I/O, 0 ошибок инвариантов |
 | Stop в последнем fault stress | Успешен; около 2047,6 мс |
 
@@ -132,3 +132,15 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 [PROMT.md](PROMT.md) — правила разработки; [CLIENT_CONTRACTS.md](CLIENT_CONTRACTS.md) — Client и Read; [RX_CONTRACTS.md](RX_CONTRACTS.md) — Rx; [MAP_PROMT.md](MAP_PROMT.md) — карты и Measurme; [README.md](README.md) — навигация.
 
 **Нормативное правило:** если документ и исходник противоречат друг другу, сначала установить конкретную ветку и commit; не переписывать код под неточную спецификацию.
+
+## 10. Проверенное состояние GitHub и уточнения — 11.11.2026
+
+В текущей ветке **реально находятся**: `ICore.ReadAsync`, `CoreLinkClient.ReadAsync`, `CoreMapLayout.Version=3`, `HeaderSize=34`, `PollFunctionCode` и маршрутизация polling FC03/FC04 в Dispatcher. Значение `PollFunctionCode` передаётся в бинарном заголовке после `PollIntervalMs`. В `ConnectionMap` сейчас задан FC03.
+
+**Разграничение API:** `PollFunctionCode` задаёт **функцию polling**. `ReadAsync(ValueIds)` в Core по-прежнему вызывает `session.ReadSingleAsync(start,count)` без выбора функции; при текущем значении по умолчанию это FC04. Прямой публичный выбор FC03/FC04 и публичный Write ещё не реализованы. Внутренние FC06/FC16 в Transport не являются пользовательским API.
+
+**Локальные отказовые испытания, 60 секунд:** FC04 polling — Snapshot 81/120, ReadAsync 59/66, 186/186 запросов Transport завершено, 10/10 зависших I/O учтено, Stop 3,2 мс. FC03 polling после переноса диагностических записей в HR20–23 — Snapshot 67/120, ReadAsync 49/58, 154/154 запросов завершено, 10/10 зависших I/O учтено, Stop 4,1 мс. Оба прогона — `INVARIANTS PASSED` (0 ошибок тестовых проверок). Неудачные вызовы происходили во время намеренных OFFLINE/HANG. Эти числа не подтверждают промышленную надёжность и не являются тестами CI.
+
+**Исправленный тестовый конфликт:** прежде диагностический FC06 записывал HR0, в то время как FC03 polling интерпретировал HR0 как `Measurme`; появлялись ошибки неизвестного значения. Тестовые регистры перенесены в HR20–23 внешнего симулятора, технологические HR0–16 не изменяются диагностическими записями. В последнем журнале ошибок `Unknown Measurme` нет.
+
+**Утверждённый ближайший объём:** объединить тесты чтения и polling в один автоматически выполняемый сценарий для FC03/FC04 с OFFLINE, HANG, RECOVERY и Stop, без ручной смены конфигурации. **Публичный Write и тесты записи отложены** до завершения чтения; найденные дефекты устранять точечно. Диагностический NModbus-клиент с отдельным TCP не засчитывать как проверку прямого CoreLink API.
