@@ -47,11 +47,11 @@ Modbus TCP → PLC
 
 `ICore`: `Start(CoreMap)`, `Stop()`, `GetSnapshot(float*, int)`, `ReadAsync(IReadOnlyList<int>)`, событие `StatusChanged`.
 
-`CoreLinkClient`: `Start(string mapId)`, `GetSnapshot(out ReadOnlyMemory<float>)`, `StopAsync()`, `Stop()`, свойства `State`, `CoreMap`, `Values`, `Statuses`.
+`CoreLinkClient`: `Start(string mapId)`, `GetSnapshot(out ReadOnlyMemory<float>)`, `ReadAsync(IReadOnlyList<int>)`, `StopAsync()`, `Stop()`, свойства `State`, `CoreMap`, `Values`, `Statuses`.
 
 `CoreStatus`, `CoreLinkState`, `SnapshotStatus` решают разные задачи. Возвращаемый snapshot — **копия в повторно используемый буфер Client**, а не долговременный immutable-array. Повторный Start после Stopped на том же Client не предусмотрен. Rx завершается прежде Core; пользовательский обработчик Rx не должен синхронно блокировать Stop.
 
-### 3.2 Локально испытанное расширение Read API
+### 3.2 Реализованный и локально испытанный Read API
 
 ```csharp
 Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
@@ -63,7 +63,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 
 Запросы по определению карты получают физический диапазон: Word — 1 регистр, Float32 — 2. Соседние диапазоны объединяются до Modbus-лимита 125 регистров, разрозненные читаются отдельно. Дублирование ValueId сохраняет дублирование результата. В этой версии запрос идёт по FC04 **Input Registers**, не FC03.
 
-**Статус внедрения:** успешно собран и протестирован пользователем локально 11.11.2026; отсутствие метода в прочитанной default branch не следует маскировать.
+**Статус внедрения:** метод присутствует в текущей ветке GitHub; успешно собран и протестирован пользователем локально 11.11.2026.
 
 ### 3.3 Запись — открытая задача
 
