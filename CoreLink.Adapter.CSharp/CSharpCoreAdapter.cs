@@ -1,3 +1,5 @@
+
+using System.Diagnostics;
 using CoreLink.Contracts.Core;
 using CoreLink.Contracts.Maps;
 using CoreLink.Core.Runtime;
@@ -8,7 +10,7 @@ namespace CoreLink.Adapter.CSharp;
 /// Адаптирует C# Core к контракту ICore.
 /// Не выполняет polling и не хранит snapshot.
 /// </summary>
-public sealed unsafe class CSharpCoreAdapter : ICore
+public sealed  class CSharpCoreAdapter : ICore
 {
     private readonly CoreLinkCore _core;
 
@@ -33,10 +35,46 @@ public sealed unsafe class CSharpCoreAdapter : ICore
         return _core.Stop();
     }
 
-    public SnapshotStatus GetSnapshot(
+    public unsafe SnapshotStatus GetSnapshot(
         float* buffer,
         int length)
     {
         return _core.GetSnapshot(buffer, length);
+    }
+
+    /// <summary>
+    /// Передаёт прямое чтение в Core.
+    ///
+    /// Исключения не пересекают границу адаптера.
+    /// </summary>
+    public async Task<CoreReadResult> ReadAsync(
+        IReadOnlyList<int> valueIds)
+    {
+        try
+        {
+            return await _core.ReadAsync(valueIds)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Заменить Trace на централизованное
+            // диагностическое логирование CoreLink.
+            try
+            {
+                Trace.TraceError(
+                    $"CoreLink ReadAsync failed: {ex}");
+            }
+            catch (Exception)
+            {
+                // Ошибка диагностики не должна
+                // нарушать контракт адаптера.
+            }
+
+            return new CoreReadResult
+            {
+                Status = CoreReadStatus.Failed,
+                Values = null
+            };
+        }
     }
 }

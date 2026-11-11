@@ -1,4 +1,5 @@
 
+using System.Diagnostics;
 using CoreLink.Contracts.Core;
 using CoreLink.Contracts.Maps;
 using CoreLink.Contracts.Registers;
@@ -255,6 +256,324 @@ public sealed class CoreLinkCore
     }
 
     /// <summary>
+    /// Асинхронно читает PLC по логическим ValueId.
+    ///
+    /// Соседние физические регистры читаются одним
+    /// Modbus-запросом, остальные — последовательно.
+    ///
+    /// Любая ошибка прекращает чтение всего набора.
+    /// Snapshot и Rx не изменяются.
+    /// </summary>
+    public async Task<CoreReadResult> ReadAsync(
+        IReadOnlyList<int> valueIds)
+    {
+        if (valueIds is null ||
+            valueIds.Count == 0)
+        {
+            return ReadError(CoreReadStatus.BadConfig);
+        }
+
+        ModbusTransportSession session;
+        DecodedCoreMap map;
+
+        lock (_snapshotLock)
+        {
+            if (_stopping ||
+                _transport is null ||
+                _map is null)
+            {
+                return ReadError(CoreReadStatus.Stopped);
+            }
+
+            session = _transport;
+            map = _map;
+        }
+
+        try
+        {
+            int valueCount = valueIds.Count;
+            var values = new float[valueCount];
+
+            // Сначала проверяем весь запрос.
+            // Ошибочный ValueId не должен приводить
+            // к частично выполненному чтению PLC.
+            for (int i = 0; i < valueCount; i++)
+            {
+                int valueId = valueIds[i];
+
+                if ((uint)valueId >=
+                    (uint)map.Registers.Length)
+                {
+                    return ReadError(CoreReadStatus.BadConfig);
+                }
+            }
+
+            int position = 0;
+
+            while (position < valueCount)
+            {
+                if (IsStopping())
+                    return ReadError(CoreReadStatus.Stopped);
+
+                int startPosition = position;
+
+                RegisterDefinition first =
+                    map.Registers[valueIds[position]];
+
+                int startAddress = first.Address;
+                int endAddress =
+                    startAddress + GetRegisterLength(first.Type);
+
+                if (endAddress == startAddress)
+                    return ReadError(CoreReadStatus.BadConfig);
+
+                position++;
+
+                // Объединяем только непосредственно соседние
+                // физические диапазоны в порядке вызова.
+                // Повторные ValueId остаются отдельными чтениями.
+                while (position < valueCount)
+                {
+                    RegisterDefinition next =
+                        map.Registers[valueIds[position]];
+
+                    int nextLength =
+                        GetRegisterLength(next.Type);
+
+                    if (nextLength == 0 ||
+                        next.Address != endAddress ||
+                        endAddress - startAddress + nextLength > 125)
+                    {
+                        break;
+                    }
+
+                    endAddress += nextLength;
+                    position++;
+                }
+
+                ushort count =
+                    (ushort)(endAddress - startAddress);
+
+                ModbusReadResult result =
+                    await session.ReadSingleAsync(
+                        (ushort)startAddress,
+                        count).ConfigureAwait(false);
+
+                if (IsStopping())
+                    return ReadError(CoreReadStatus.Stopped);
+
+                if (result.Status != ModbusTransportStatus.Ok)
+                {
+                    return ReadError(
+                        MapReadStatus(result.Status));
+                }
+
+                ushort[]? registers = result.Data;
+
+                if (registers is null ||
+                    registers.Length != count)
+                {
+                    return ReadError(CoreReadStatus.Failed);
+                }
+
+                for (int i = startPosition;
+                     i < position;
+                     i++)
+                {
+                    RegisterDefinition definition =
+                        map.Registers[valueIds[i]];
+
+                    int offset =
+                        definition.Address - startAddress;
+
+                    if (!TryDecodeValue(
+                            registers,
+                            offset,
+                            definition.Type,
+                            map.RegisterOrder,
+                            out float value))
+                    {
+                        return ReadError(CoreReadStatus.Failed);
+                    }
+
+                    values[i] = value;
+                }
+            }
+
+            if (IsStopping())
+                return ReadError(CoreReadStatus.Stopped);
+
+            return new CoreReadResult
+            {
+                Status = CoreReadStatus.Ok,
+                Values = values
+            };
+        }
+        catch (ObjectDisposedException)
+        {
+            return ReadError(CoreReadStatus.Stopped);
+        }
+        catch (InvalidOperationException)
+        {
+            return ReadError(
+                IsStopping()
+                    ? CoreReadStatus.Stopped
+                    : CoreReadStatus.Failed);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Заменить Trace централизованным
+            // диагностическим логированием CoreLink.
+            ReportReadError(ex);
+
+            return ReadError(
+                IsStopping()
+                    ? CoreReadStatus.Stopped
+                    : CoreReadStatus.Failed);
+        }
+    }
+
+    /// <summary>
+    /// Декодирует одно значение внутри прочитанного
+    /// физического диапазона.
+    /// </summary>
+    private static bool TryDecodeValue(
+        ushort[] registers,
+        int index,
+        RegisterType type,
+        RegisterOrder order,
+        out float value)
+    {
+        value = default;
+
+        if (index < 0)
+            return false;
+
+        switch (type)
+        {
+            case RegisterType.Word:
+                {
+                    if (index >= registers.Length)
+                        return false;
+
+                    value = registers[index];
+                    return true;
+                }
+
+            case RegisterType.Float:
+                {
+                    if (index >= registers.Length - 1)
+                        return false;
+
+                    ushort lowWord = registers[index];
+                    ushort highWord = registers[index + 1];
+
+                    switch (order)
+                    {
+                        case RegisterOrder.ABCD:
+                            break;
+
+                        case RegisterOrder.BADC:
+                            lowWord = SwapBytes(lowWord);
+                            highWord = SwapBytes(highWord);
+                            break;
+
+                        case RegisterOrder.CDAB:
+                            (lowWord, highWord) =
+                                (highWord, lowWord);
+                            break;
+
+                        case RegisterOrder.DCBA:
+                            (lowWord, highWord) =
+                                (SwapBytes(highWord),
+                                 SwapBytes(lowWord));
+                            break;
+
+                        default:
+                            return false;
+                    }
+
+                    value = ModbusUtility.GetSingle(
+                        highWord,
+                        lowWord);
+
+                    return true;
+                }
+
+            default:
+                return false;
+        }
+    }
+
+    private static int GetRegisterLength(
+        RegisterType type)
+    {
+        return type switch
+        {
+            RegisterType.Word => 1,
+            RegisterType.Float => 2,
+            _ => 0
+        };
+    }
+
+    private static CoreReadStatus MapReadStatus(
+        ModbusTransportStatus status)
+    {
+        return status switch
+        {
+            ModbusTransportStatus.Ok =>
+                CoreReadStatus.Ok,
+
+            ModbusTransportStatus.Disconnected or
+            ModbusTransportStatus.ConnectTimeout =>
+                CoreReadStatus.Disconnected,
+
+            ModbusTransportStatus.RequestTimeout =>
+                CoreReadStatus.Timeout,
+
+            ModbusTransportStatus.Cancelled =>
+                CoreReadStatus.Stopped,
+
+            _ =>
+                CoreReadStatus.Failed
+        };
+    }
+
+    private static CoreReadResult ReadError(
+        CoreReadStatus status)
+    {
+        return new CoreReadResult
+        {
+            Status = status,
+            Values = null
+        };
+    }
+
+    private bool IsStopping()
+    {
+        lock (_snapshotLock)
+        {
+            return _stopping ||
+                   _transport is null;
+        }
+    }
+
+    private static void ReportReadError(
+        Exception exception)
+    {
+        try
+        {
+            Trace.TraceError(
+                $"CoreLink direct read failed: {exception}");
+        }
+        catch (Exception)
+        {
+            // Ошибка диагностики не должна
+            // нарушать выполнение Core.
+        }
+    }
+
+    /// <summary>
     /// Получает завершённый блок Input Registers.
     ///
     /// Декодирует весь блок и только после успешного
@@ -447,60 +766,60 @@ public sealed class CoreLinkCore
             switch (definition.Type)
             {
                 case RegisterType.Word:
-                {
-                    if ((uint)index >=
-                        (uint)registers.Length)
                     {
-                        return false;
-                    }
+                        if ((uint)index >=
+                            (uint)registers.Length)
+                        {
+                            return false;
+                        }
 
-                    destination[i] = registers[index];
-                    break;
-                }
+                        destination[i] = registers[index];
+                        break;
+                    }
 
                 case RegisterType.Float:
-                {
-                    if (index < 0 ||
-                        index >= registers.Length - 1)
                     {
-                        return false;
-                    }
-
-                    ushort lowWord = registers[index];
-                    ushort highWord = registers[index + 1];
-
-                    switch (map.RegisterOrder)
-                    {
-                        case RegisterOrder.ABCD:
-                            break;
-
-                        case RegisterOrder.BADC:
-                            lowWord = SwapBytes(lowWord);
-                            highWord = SwapBytes(highWord);
-                            break;
-
-                        case RegisterOrder.CDAB:
-                            (lowWord, highWord) =
-                                (highWord, lowWord);
-                            break;
-
-                        case RegisterOrder.DCBA:
-                            (lowWord, highWord) =
-                                (SwapBytes(highWord),
-                                 SwapBytes(lowWord));
-                            break;
-
-                        default:
+                        if (index < 0 ||
+                            index >= registers.Length - 1)
+                        {
                             return false;
+                        }
+
+                        ushort lowWord = registers[index];
+                        ushort highWord = registers[index + 1];
+
+                        switch (map.RegisterOrder)
+                        {
+                            case RegisterOrder.ABCD:
+                                break;
+
+                            case RegisterOrder.BADC:
+                                lowWord = SwapBytes(lowWord);
+                                highWord = SwapBytes(highWord);
+                                break;
+
+                            case RegisterOrder.CDAB:
+                                (lowWord, highWord) =
+                                    (highWord, lowWord);
+                                break;
+
+                            case RegisterOrder.DCBA:
+                                (lowWord, highWord) =
+                                    (SwapBytes(highWord),
+                                     SwapBytes(lowWord));
+                                break;
+
+                            default:
+                                return false;
+                        }
+
+                        destination[i] =
+                            ModbusUtility.GetSingle(
+                                highWord,
+                                lowWord);
+
+                        break;
                     }
-
-                    destination[i] =
-                        ModbusUtility.GetSingle(
-                            highWord,
-                            lowWord);
-
-                    break;
-                }
 
                 default:
                     return false;
@@ -510,6 +829,10 @@ public sealed class CoreLinkCore
         return true;
     }
 
+
+    // TODO: Унифицировать декодирование Word/Float для polling
+    // и прямого ReadAsync. Исключить дублирование логики
+    // RegisterOrder и SwapBytes. Решение требует согласования.
     /// <summary>
     /// Меняет порядок байтов одного Modbus WORD.
     /// </summary>

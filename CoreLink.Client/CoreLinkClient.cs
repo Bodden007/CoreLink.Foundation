@@ -276,6 +276,64 @@ public sealed class CoreLinkClient
     }
 
     /// <summary>
+    /// Асинхронно читает значения PLC по ValueId.
+    ///
+    /// Не использует snapshot и не изменяет Rx.
+    /// При любой ошибке возвращает общий статус
+    /// без частично прочитанных значений.
+    ///
+    /// Исключения не выходят за границу Client.
+    /// </summary>
+    public async Task<CoreReadResult> ReadAsync(
+        IReadOnlyList<int> valueIds)
+    {
+        lock (_lifecycleLock)
+        {
+            if (_state != CoreLinkState.Running)
+            {
+                return new CoreReadResult
+                {
+                    Status = CoreReadStatus.Stopped,
+                    Values = null
+                };
+            }
+        }
+
+        if (valueIds is null ||
+            valueIds.Count == 0)
+        {
+            return new CoreReadResult
+            {
+                Status = CoreReadStatus.BadConfig,
+                Values = null
+            };
+        }
+
+        try
+        {
+            CoreReadResult result =
+                await _core.ReadAsync(valueIds)
+                    .ConfigureAwait(false);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            // TODO: Заменить временный Trace
+            // централизованным логированием CoreLink.
+            ReportError(
+                "Direct register read failed.",
+                ex);
+
+            return new CoreReadResult
+            {
+                Status = CoreReadStatus.Failed,
+                Values = null
+            };
+        }
+    }
+
+    /// <summary>
     /// SnapshotReader, принадлежащий Rx.
     ///
     /// Использует отдельный постоянный буфер.
@@ -439,6 +497,8 @@ public sealed class CoreLinkClient
         string message,
         Exception? exception = null)
     {
+        // TODO: Внедрить централизованное
+        // диагностическое логирование CoreLink.
         try
         {
             Trace.TraceError(

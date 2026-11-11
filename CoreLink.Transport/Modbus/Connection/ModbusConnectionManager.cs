@@ -63,6 +63,8 @@ internal sealed class ModbusConnectionManager : IDisposable
     public long RequestLockWaitCount { get; private set; }
     public long RequestLockEnterCount { get; private set; }
     public long RequestStartedCount { get; private set; }
+    // Любой запрос, прошедший диагностическую обёртку до конца,
+    // включая ошибку, timeout и отмену.
     public long RequestCompletedCount { get; private set; }
     public long HungRequestCount { get; private set; }
     public long RecoveredRequestCount { get; private set; }
@@ -581,8 +583,6 @@ internal sealed class ModbusConnectionManager : IDisposable
                 LastSuccessTime =
                     DateTime.Now;
 
-                RequestCompletedCount++;
-
                 return (
                     ModbusTransportStatus.Ok,
                     result);
@@ -645,6 +645,10 @@ internal sealed class ModbusConnectionManager : IDisposable
         }
         finally
         {
+            // Учитываем все завершения, не только успешные ответы.
+            // При незавершённом физическом Task (HANG) сюда не попадём:
+            // сначала нужно дождаться его остановки после CloseConnection.
+            RequestCompletedCount++;
             RequestInProgress = false;
             RequestIsHung = false;
             CurrentRequestStartedAt = null;

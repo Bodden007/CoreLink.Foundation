@@ -1,234 +1,283 @@
-
 using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Reactive.Linq;
 using CoreLink.Adapter.CSharp;
 using CoreLink.Client;
 using CoreLink.Client.Results;
 using CoreLink.Contracts.Core;
 using CoreLink.Maps;
+using NModbus;
 
-// Интеграционный smoke test.
-//
-// Проверяет цепочку:
-// TestHost -> Client -> Rx -> Client -> ICore
-//                         -> Core -> Transport -> PLC
-//
-// Публичное чтение snapshot выполняется параллельно
-// с собственным рабочим циклом Rx.
-//
-// Тест не выполняет Write и не изменяет регистры PLC.
-
+// Integration stress test: CoreLink polling + periodic CoreLink ReadAsync
+// + independent test-only Modbus FC06/FC16/FC03 client.
+// WARNING: write operations are intentionally restricted to loopback.
 const string mapId = "physical";
-const int testDurationMs = 60_000;
-const int snapshotIntervalMs = 500;
+const int durationSeconds = 60;
+const int snapshotPeriodMs = 500;
+const int readPeriodMs = 700;
+const int writePeriodMs = 2100;
+const int ioTimeoutMs = 1500;
 
-var mapProvider = new MapProvider();
+var provider = new MapProvider();
 
-if (!mapProvider.TryLoad(mapId, out var map) ||
+if (!provider.TryLoad(mapId, out var map) ||
     map is null)
 {
-    Console.WriteLine("MAP LOAD FAILED");
+    Console.WriteLine("CORE MAP LOAD FAILED");
     return;
 }
 
-if (!mapProvider.TryLoadRxMap(
+if (!provider.TryLoadRxMap(
         mapId,
         out var rxMap,
-        out string? mapError) ||
+        out var mapError) ||
     rxMap is null)
 {
-    Console.WriteLine(
-        $"RX MAP LOAD FAILED: {mapError}");
+    Console.WriteLine($"RX MAP ERROR: {mapError}");
     return;
 }
 
-if (map.Buffer.Length < 14 ||
-    map.BufferLength <= 0 ||
-    map.BufferLength != rxMap.Values.Length)
+byte[] config = map.Buffer.ToArray();
+if (config.Length < 14 || map.BufferLength != rxMap.Values.Length)
 {
     Console.WriteLine("INVALID MAP");
     return;
 }
 
-int pollIntervalMs =
-    BinaryPrimitives.ReadInt32LittleEndian(
-        map.Buffer.Span.Slice(10, 4));
+IPAddress ip = new IPAddress(config.AsSpan(3, 4));
+ushort port = BinaryPrimitives.ReadUInt16LittleEndian(config.AsSpan(7, 2));
+byte unitId = config[9];
+int pollingMs = BinaryPrimitives.ReadInt32LittleEndian(config.AsSpan(10, 4));
 
-Console.WriteLine("======================================");
-Console.WriteLine("CORELINK CLIENT + RX TEST");
-Console.WriteLine("======================================");
-Console.WriteLine($"Map: {mapId}");
-Console.WriteLine($"Values: {map.BufferLength}");
-Console.WriteLine($"Polling: {pollIntervalMs} ms");
-Console.WriteLine($"Rx interval: {rxMap.RxIntervalMs} ms");
-Console.WriteLine($"Test duration: {testDurationMs} ms");
-Console.WriteLine();
-
-var adapter = new CSharpCoreAdapter();
-var client = new CoreLinkClient(mapProvider, adapter);
+// No accidental writes to production PLCs, regardless of the map configuration.
+if (!IPAddress.IsLoopback(ip) || port != 1502 || unitId != 1)
+{
+    Console.WriteLine("SAFETY STOP: stress writer permits only 127.0.0.1:1502, UnitId=1.");
+    return;
+}
 
 var outputLock = new object();
+var client = new CoreLinkClient(provider, new CSharpCoreAdapter());
+var runCts = new CancellationTokenSource();
 
-int rxValueCount = 0;
-int rxStatusCount = 0;
-int snapshotOkCount = 0;
-int snapshotNoDataCount = 0;
-int snapshotDisconnectedCount = 0;
-int snapshotErrorCount = 0;
+long snapshotOk = 0, snapshotUnavailable = 0, readOk = 0, readUnavailable = 0;
+long writeOk = 0, writeUnavailable = 0, invariantFailures = 0;
+long rxEvents = 0, rxStatusEvents = 0;
+long readCycles = 0, writeCycles = 0;
+long snapshotCycles = 0;
+long singleWrites = 0, multipleWrites = 0;
 
-adapter.StatusChanged += status =>
+void Log(string message)
 {
-    WriteLine($"CORE STATUS: {status}");
-};
+    lock (outputLock)
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+}
 
-IDisposable? valuesSubscription = null;
-IDisposable? statusesSubscription = null;
+void Check(bool condition, string title)
+{
+    if (!condition)
+    {
+        Interlocked.Increment(ref invariantFailures);
+        Log($"[FAIL] {title}");
+    }
+}
 
-CoreLinkResult startResult = CoreLinkResult.SessionError;
+IDisposable? subValues = null;
+IDisposable? subStatuses = null;
+Task? snapshotTask = null, readTask = null, writeTask = null;
 CoreLinkResult stopResult = CoreLinkResult.SessionError;
+
+Log($"STRESS START: PLC={ip}:{port}, UnitId={unitId}");
+Log($"Polling={pollingMs}ms, Snapshot={snapshotPeriodMs}ms, Read={readPeriodMs}ms, Write={writePeriodMs}ms");
+Log("Writes: ONLY emulator Holding Registers addresses 0..3");
 
 try
 {
-    startResult = client.Start(mapId);
-
-    WriteLine($"START RESULT: {startResult}");
-    WriteLine($"CLIENT STATE: {client.State}");
-
-    if (startResult == CoreLinkResult.Ok)
+    CoreLinkResult start = client.Start(mapId);
+    if (start != CoreLinkResult.Ok)
     {
-        var valuesStream = client.Values;
-        var statusesStream = client.Statuses;
-
-        if (valuesStream is null ||
-            statusesStream is null)
-        {
-            WriteLine("RX STREAMS UNAVAILABLE");
-        }
-        else
-        {
-            valuesSubscription = valuesStream.Subscribe(value =>
-            {
-                Interlocked.Increment(ref rxValueCount);
-
-                WriteLine(
-                    $"RX VALUE [{value.ValueId}] " +
-                    $"{value.Name} = {value.Value} " +
-                    $"{value.Unit}");
-            });
-
-            statusesSubscription = statusesStream.Subscribe(status =>
-            {
-                Interlocked.Increment(ref rxStatusCount);
-
-                WriteLine($"RX STATUS: {status}");
-            });
-
-            // CoreLinkRx — hot stream без replay.
-            // Публикации до подписки могут быть пропущены.
-
-            int iterations =
-                testDurationMs / snapshotIntervalMs;
-
-            for (int i = 0; i < iterations; i++)
-            {
-                await Task.Delay(snapshotIntervalMs);
-
-                // Публичный snapshot использует _coreBuffer.
-                // Рабочий цикл Rx использует _rxBuffer.
-                // Оба обращения синхронизированы Client.
-                SnapshotStatus status =
-                    client.GetSnapshot(out var snapshot);
-
-                switch (status)
-                {
-                    case SnapshotStatus.Ok:
-                        snapshotOkCount++;
-
-                        WriteLine(
-                            $"SNAPSHOT: Ok, values={snapshot.Length}");
-
-                        break;
-
-                    case SnapshotStatus.NoData:
-                        snapshotNoDataCount++;
-                        WriteLine("SNAPSHOT: NoData");
-                        break;
-
-                    case SnapshotStatus.Disconnected:
-                        snapshotDisconnectedCount++;
-                        WriteLine("SNAPSHOT: Disconnected");
-                        break;
-
-                    default:
-                        snapshotErrorCount++;
-                        WriteLine($"SNAPSHOT: {status}");
-                        break;
-                }
-            }
-        }
+        Log($"CORE START FAILED: {start}");
+        return;
     }
+
+    subValues = client.Values?.Subscribe(_ => Interlocked.Increment(ref rxEvents));
+    subStatuses = client.Statuses?.Subscribe(status =>
+    {
+        Interlocked.Increment(ref rxStatusEvents);
+        Log($"RX STATUS: {status}");
+    });
+
+    using var durationCts = new CancellationTokenSource(TimeSpan.FromSeconds(durationSeconds));
+    using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(
+        runCts.Token, durationCts.Token);
+    CancellationToken token = combinedCts.Token;
+
+    snapshotTask = SnapshotLoop(token);
+    readTask = ReadLoop(token);
+    writeTask = WriteLoop(token);
+
+    await Task.WhenAll(snapshotTask, readTask, writeTask);
+}
+catch (OperationCanceledException)
+{
+    // Normal duration expiry.
 }
 catch (Exception ex)
 {
-    WriteLine($"TEST EXCEPTION: {ex}");
+    Check(false, $"TEST EXCEPTION: {ex}");
 }
 finally
 {
-    WriteLine("STOPPING CLIENT...");
+    await runCts.CancelAsync();
+    foreach (Task? worker in new[] { snapshotTask, readTask, writeTask })
+    {
+        if (worker is null) continue;
+        try { await worker; }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { Check(false, $"WORKER FAULT: {ex}"); }
+    }
 
     try
     {
         stopResult = await client.StopAsync();
-
-        WriteLine($"STOP RESULT: {stopResult}");
-        WriteLine($"CLIENT STATE: {client.State}");
+        Log($"CORE STOP: {stopResult}");
     }
     catch (Exception ex)
     {
-        WriteLine($"STOP EXCEPTION: {ex}");
+        Check(false, $"STOP EXCEPTION: {ex}");
     }
 
-    // Подписки освобождаются после завершения Rx.
-    valuesSubscription?.Dispose();
-    statusesSubscription?.Dispose();
+    subValues?.Dispose();
+    subStatuses?.Dispose();
+    runCts.Dispose();
 }
 
-WriteLine("");
-WriteLine("======================================");
-WriteLine("TEST SUMMARY");
-WriteLine("======================================");
+Check(stopResult == CoreLinkResult.Ok, "Core Stop must succeed");
+Check(client.GetSnapshot(out var afterStop) == SnapshotStatus.Stopped &&
+      afterStop.IsEmpty, "Snapshot after Stop");
+CoreReadResult afterStopRead = await client.ReadAsync([0]);
+Check(afterStopRead.Status == CoreReadStatus.Stopped &&
+      afterStopRead.Values is null, "Read after Stop");
 
-WriteLine($"Start: {startResult}");
-WriteLine($"Stop: {stopResult}");
-WriteLine($"Final state: {client.State}");
+Log("============== STRESS SUMMARY ==============");
+Log($"Snapshot: cycles={snapshotCycles}, ok={snapshotOk}, unavailable={snapshotUnavailable}");
+Log($"Direct Read: cycles={readCycles}, ok={readOk}, unavailable={readUnavailable}");
+Log($"Writes: cycles={writeCycles}, ok={writeOk}, unavailable={writeUnavailable}, FC06={singleWrites}, FC16={multipleWrites}");
+Log($"Rx value events={rxEvents}, Rx status events={rxStatusEvents}");
+Log($"Invariant failures={invariantFailures}");
+Log(invariantFailures == 0 ? "INVARIANTS PASSED" : "INVARIANTS FAILED");
+Log("Note: FC06/FC16/FC03 here use an independent diagnostic TCP connection, not CoreLink Dispatcher.");
 
-WriteLine($"Rx value events: {rxValueCount}");
-WriteLine($"Rx status events: {rxStatusCount}");
-
-WriteLine($"Snapshot Ok: {snapshotOkCount}");
-WriteLine($"Snapshot NoData: {snapshotNoDataCount}");
-WriteLine($"Snapshot Disconnected: {snapshotDisconnectedCount}");
-WriteLine($"Snapshot Errors: {snapshotErrorCount}");
-
-SnapshotStatus afterStop =
-    client.GetSnapshot(out var afterStopValues);
-
-WriteLine($"Snapshot after Stop: {afterStop}");
-WriteLine($"Values after Stop: {afterStopValues.Length}");
-
-CoreLinkResult repeatedStop =
-    await client.StopAsync();
-
-WriteLine($"Repeated Stop: {repeatedStop}");
-
-WriteLine("");
-WriteLine("TEST COMPLETED");
-
-void WriteLine(string message)
+async Task SnapshotLoop(CancellationToken token)
 {
-    lock (outputLock)
+    using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(snapshotPeriodMs));
+    while (await timer.WaitForNextTickAsync(token))
     {
-        Console.WriteLine(
-            $"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+        Interlocked.Increment(ref snapshotCycles);
+        SnapshotStatus status = client.GetSnapshot(out var snapshot);
+        if (status == SnapshotStatus.Ok)
+        {
+            Interlocked.Increment(ref snapshotOk);
+            Check(snapshot.Length == map.BufferLength, "Snapshot length");
+        }
+        else
+        {
+            Interlocked.Increment(ref snapshotUnavailable);
+            Log($"SNAPSHOT: {status}");
+        }
+    }
+}
+
+async Task ReadLoop(CancellationToken token)
+{
+    using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(readPeriodMs));
+    int cycle = 0;
+    while (await timer.WaitForNextTickAsync(token))
+    {
+        token.ThrowIfCancellationRequested();
+        Interlocked.Increment(ref readCycles);
+        int[] ids = (cycle++ % 3) switch
+        {
+            0 => [0],
+            1 => [2, 3, 4],
+            _ => [0, 2, 8]
+        };
+        var watch = Stopwatch.StartNew();
+        CoreReadResult result = await client.ReadAsync(ids);
+        watch.Stop();
+        if (result.Status == CoreReadStatus.Ok)
+        {
+            Interlocked.Increment(ref readOk);
+            Check(result.Values is not null && result.Values.Length == ids.Length,
+                  "Direct Read result length");
+            if (result.Values is not null && result.Values.Length == ids.Length)
+                Log($"READ OK [{string.Join(',', ids)}] = [{string.Join(';', result.Values)}], {watch.ElapsedMilliseconds}ms");
+        }
+        else
+        {
+            Interlocked.Increment(ref readUnavailable);
+            Check(result.Values is null, "No partial data when Read fails");
+            Log($"READ ERROR: {result.Status}, {watch.ElapsedMilliseconds}ms");
+        }
+    }
+}
+
+async Task WriteLoop(CancellationToken token)
+{
+    using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(writePeriodMs));
+    ushort sequence = 0;
+    while (await timer.WaitForNextTickAsync(token))
+    {
+        token.ThrowIfCancellationRequested();
+        Interlocked.Increment(ref writeCycles);
+        sequence++;
+        ushort word = (ushort)(1000 + sequence);
+        ushort[] block = [(ushort)(2000 + sequence), (ushort)(3000 + sequence), (ushort)(4000 + sequence)];
+
+        try
+        {
+            // Separate diagnostic client: do not change CoreLink transport ownership.
+            using var tcp = new TcpClient();
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+            deadline.CancelAfter(ioTimeoutMs);
+            await tcp.ConnectAsync(ip, port, deadline.Token);
+            using var master = new ModbusFactory().CreateMaster(tcp);
+
+            // NModbus APIs do not accept cancellation; socket is disposed on timeout.
+            await master.WriteSingleRegisterAsync(unitId, 0, word)
+                .WaitAsync(TimeSpan.FromMilliseconds(ioTimeoutMs), token);
+            Interlocked.Increment(ref singleWrites);
+            await master.WriteMultipleRegistersAsync(unitId, 1, block)
+                .WaitAsync(TimeSpan.FromMilliseconds(ioTimeoutMs), token);
+            Interlocked.Increment(ref multipleWrites);
+
+            ushort[] got = await master.ReadHoldingRegistersAsync(unitId, 0, 4)
+                .WaitAsync(TimeSpan.FromMilliseconds(ioTimeoutMs), token);
+            Check(got.Length == 4, "FC03 readback length");
+            if (got.Length == 4)
+                Check(got[0] == word && got[1] == block[0] &&
+                      got[2] == block[1] && got[3] == block[2],
+                      "FC06/FC16 -> FC03 readback values");
+            Interlocked.Increment(ref writeOk);
+            Log($"WRITE OK FC06 addr0={word}; FC16 addr1..3=[{string.Join(',', block)}]; FC03 verified");
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex) when (ex is SocketException or IOException or
+                                   TimeoutException or OperationCanceledException or
+                                   ObjectDisposedException ||
+                                   ex.GetType().Name.Contains("SlaveException", StringComparison.Ordinal))
+        {
+            Interlocked.Increment(ref writeUnavailable);
+            Log($"WRITE/VERIFY UNAVAILABLE: {ex.GetType().Name}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Check(false, $"WRITE UNEXPECTED EXCEPTION: {ex}");
+        }
     }
 }

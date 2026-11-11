@@ -43,6 +43,21 @@ public unsafe interface ICore
         int length);
 
     /// <summary>
+    /// Асинхронно читает значения PLC по логическим ValueId.
+    ///
+    /// Адреса и типы регистров определяются картой Core.
+    /// Порядок результата соответствует порядку ValueId.
+    ///
+    /// При любой ошибке чтение прекращается.
+    /// Частичные результаты не возвращаются.
+    /// Штатные ошибки преобразуются в CoreReadStatus.
+    ///
+    /// Прямое чтение не изменяет основной snapshot.
+    /// </summary>
+    Task<CoreReadResult> ReadAsync(
+        IReadOnlyList<int> valueIds);
+
+    /// <summary>
     /// Уведомляет об изменении состояния Core.
     /// </summary>
     event Action<CoreStatus>? StatusChanged;
