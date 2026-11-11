@@ -5,6 +5,7 @@
   <Project Path="CoreLink.Contracts/CoreLink.Contracts.csproj" />
   <Project Path="CoreLink.Core/CoreLink.Core.csproj" />
   <Project Path="CoreLink.Maps/CoreLink.Maps.csproj" />
+  <Project Path="CoreLink.NModbus.AotTest/CoreLink.NModbus.AotTest.csproj" />
   <Project Path="CoreLink.Rx/CoreLink.Rx.csproj" />
   <Project Path="CoreLink.Transport/CoreLink.Transport.csproj" />
 </Solution>
