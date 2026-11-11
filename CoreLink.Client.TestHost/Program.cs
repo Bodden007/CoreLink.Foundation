@@ -11,36 +11,36 @@ using CoreLink.Maps;
 using NModbus;
 
 // Integration stress test: CoreLink polling + periodic CoreLink ReadAsync
-// + independent test-only Modbus FC06/FC16/FC03 client.
+// + independent test-only Modbus FC03/FC04/FC06/FC16 client.
 // WARNING: write operations are intentionally restricted to loopback.
 const string mapId = "physical";
 const int durationSeconds = 60;
 const int snapshotPeriodMs = 500;
 const int readPeriodMs = 700;
+const int fc04ReadPeriodMs = 1100;
+const int fc03ReadPeriodMs = 1300;
 const int writePeriodMs = 2100;
 const int ioTimeoutMs = 1500;
 
+Trace.Listeners.Add(new TextWriterTraceListener(Console.Error));
+Trace.AutoFlush = true;
+
 var provider = new MapProvider();
 
-if (!provider.TryLoad(mapId, out var map) ||
-    map is null)
+if (!provider.TryLoad(mapId, out var map) || map is null)
 {
     Console.WriteLine("CORE MAP LOAD FAILED");
     return;
 }
 
-if (!provider.TryLoadRxMap(
-        mapId,
-        out var rxMap,
-        out var mapError) ||
-    rxMap is null)
+if (!provider.TryLoadRxMap(mapId, out var rxMap, out var mapError) || rxMap is null)
 {
     Console.WriteLine($"RX MAP ERROR: {mapError}");
     return;
 }
 
 byte[] config = map.Buffer.ToArray();
-if (config.Length < 14 || map.BufferLength != rxMap.Values.Length)
+if (config.Length < 15 || map.BufferLength != rxMap.Values.Length)
 {
     Console.WriteLine("INVALID MAP");
     return;
@@ -50,8 +50,15 @@ IPAddress ip = new IPAddress(config.AsSpan(3, 4));
 ushort port = BinaryPrimitives.ReadUInt16LittleEndian(config.AsSpan(7, 2));
 byte unitId = config[9];
 int pollingMs = BinaryPrimitives.ReadInt32LittleEndian(config.AsSpan(10, 4));
+byte pollingFunctionCode = config[14]; // CoreMap v3: immediately after PollIntervalMs.
 
-// No accidental writes to production PLCs, regardless of the map configuration.
+if (pollingFunctionCode is not (3 or 4))
+{
+    Console.WriteLine($"INVALID POLLING FUNCTION CODE: {pollingFunctionCode}");
+    return;
+}
+
+// No accidental writes to production PLCs, regardless of map configuration.
 if (!IPAddress.IsLoopback(ip) || port != 1502 || unitId != 1)
 {
     Console.WriteLine("SAFETY STOP: stress writer permits only 127.0.0.1:1502, UnitId=1.");
@@ -64,10 +71,13 @@ var runCts = new CancellationTokenSource();
 
 long snapshotOk = 0, snapshotUnavailable = 0, readOk = 0, readUnavailable = 0;
 long writeOk = 0, writeUnavailable = 0, invariantFailures = 0;
+long fc03Ok = 0, fc03Unavailable = 0, fc04Ok = 0, fc04Unavailable = 0;
+long fc03Cycles = 0, fc04Cycles = 0;
 long rxEvents = 0, rxStatusEvents = 0;
 long readCycles = 0, writeCycles = 0;
 long snapshotCycles = 0;
 long singleWrites = 0, multipleWrites = 0;
+long writeVerified = 0;
 
 void Log(string message)
 {
@@ -87,11 +97,14 @@ void Check(bool condition, string title)
 IDisposable? subValues = null;
 IDisposable? subStatuses = null;
 Task? snapshotTask = null, readTask = null, writeTask = null;
+Task? fc03Task = null, fc04Task = null;
 CoreLinkResult stopResult = CoreLinkResult.SessionError;
 
 Log($"STRESS START: PLC={ip}:{port}, UnitId={unitId}");
-Log($"Polling={pollingMs}ms, Snapshot={snapshotPeriodMs}ms, Read={readPeriodMs}ms, Write={writePeriodMs}ms");
-Log("Writes: ONLY emulator Holding Registers addresses 0..3");
+Log($"CoreLink polling: FC{pollingFunctionCode:D2}, interval={pollingMs}ms");
+Log($"Snapshot={snapshotPeriodMs}ms, MappedRead={readPeriodMs}ms, FC04={fc04ReadPeriodMs}ms, FC03={fc03ReadPeriodMs}ms, Write={writePeriodMs}ms");
+Log("Diagnostic: separate FC04 read, FC03 read, FC06/FC16 writes verified by FC03");
+Log("Writes: ONLY emulator Holding Registers addresses 20..23");
 
 try
 {
@@ -116,9 +129,11 @@ try
 
     snapshotTask = SnapshotLoop(token);
     readTask = ReadLoop(token);
+    fc04Task = Fc04Loop(token);
+    fc03Task = Fc03Loop(token);
     writeTask = WriteLoop(token);
 
-    await Task.WhenAll(snapshotTask, readTask, writeTask);
+    await Task.WhenAll(snapshotTask, readTask, fc04Task, fc03Task, writeTask);
 }
 catch (OperationCanceledException)
 {
@@ -131,7 +146,7 @@ catch (Exception ex)
 finally
 {
     await runCts.CancelAsync();
-    foreach (Task? worker in new[] { snapshotTask, readTask, writeTask })
+    foreach (Task? worker in new[] { snapshotTask, readTask, fc04Task, fc03Task, writeTask })
     {
         if (worker is null) continue;
         try { await worker; }
@@ -162,13 +177,15 @@ Check(afterStopRead.Status == CoreReadStatus.Stopped &&
       afterStopRead.Values is null, "Read after Stop");
 
 Log("============== STRESS SUMMARY ==============");
+Log($"CoreLink Polling FC{pollingFunctionCode:D2}: Rx value events={rxEvents}, Rx status events={rxStatusEvents}");
 Log($"Snapshot: cycles={snapshotCycles}, ok={snapshotOk}, unavailable={snapshotUnavailable}");
-Log($"Direct Read: cycles={readCycles}, ok={readOk}, unavailable={readUnavailable}");
-Log($"Writes: cycles={writeCycles}, ok={writeOk}, unavailable={writeUnavailable}, FC06={singleWrites}, FC16={multipleWrites}");
-Log($"Rx value events={rxEvents}, Rx status events={rxStatusEvents}");
+Log($"CoreLink Direct Read: cycles={readCycles}, ok={readOk}, unavailable={readUnavailable}");
+Log($"FC04 Read: cycles={fc04Cycles}, ok={fc04Ok}, unavailable={fc04Unavailable}");
+Log($"FC03 Read: cycles={fc03Cycles}, ok={fc03Ok}, unavailable={fc03Unavailable}");
+Log($"Write FC06/FC16: cycles={writeCycles}, ok={writeOk}, unavailable={writeUnavailable}, FC06={singleWrites}, FC16={multipleWrites}, verified via FC03={writeVerified}");
 Log($"Invariant failures={invariantFailures}");
 Log(invariantFailures == 0 ? "INVARIANTS PASSED" : "INVARIANTS FAILED");
-Log("Note: FC06/FC16/FC03 here use an independent diagnostic TCP connection, not CoreLink Dispatcher.");
+Log("Note: FC03/FC04 diagnostic reads and FC06/FC16 writes use independent TCP connections; only polling and mapped ReadAsync traverse CoreLink.");
 
 async Task SnapshotLoop(CancellationToken token)
 {
@@ -224,6 +241,106 @@ async Task ReadLoop(CancellationToken token)
     }
 }
 
+// The diagnostic reads and writes use separate connections intentionally.
+// They validate the emulator/protocol, not CoreLink Dispatcher routing.
+async Task Fc04Loop(CancellationToken token)
+{
+    using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(fc04ReadPeriodMs));
+    while (await timer.WaitForNextTickAsync(token))
+    {
+        token.ThrowIfCancellationRequested();
+        Interlocked.Increment(ref fc04Cycles);
+        try
+        {
+            using var tcp = new TcpClient();
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+            deadline.CancelAfter(ioTimeoutMs);
+            await tcp.ConnectAsync(ip, port, deadline.Token);
+            using var master = new ModbusFactory().CreateMaster(tcp);
+
+            ushort[] input = await master.ReadInputRegistersAsync(unitId, 0, 17)
+                .WaitAsync(TimeSpan.FromMilliseconds(ioTimeoutMs), token);
+            if (input.Length != 17 || input[0] > 9)
+            {
+                Check(false, "FC04 response length / Measurme range");
+                continue;
+            }
+
+            Interlocked.Increment(ref fc04Ok);
+            Log($"FC04 OK: 17 Input Registers, Measurme={input[0]}, Status={input[1]}");
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex) when (IsExpectedIoFailure(ex))
+        {
+            Interlocked.Increment(ref fc04Unavailable);
+            Log($"FC04 UNAVAILABLE: {ex.GetType().Name}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Check(false, $"FC04 UNEXPECTED EXCEPTION: {ex}");
+        }
+    }
+}
+
+async Task Fc03Loop(CancellationToken token)
+{
+    using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(fc03ReadPeriodMs));
+    while (await timer.WaitForNextTickAsync(token))
+    {
+        token.ThrowIfCancellationRequested();
+        Interlocked.Increment(ref fc03Cycles);
+        try
+        {
+            using var tcp = new TcpClient();
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+            deadline.CancelAfter(ioTimeoutMs);
+            await tcp.ConnectAsync(ip, port, deadline.Token);
+            using var master = new ModbusFactory().CreateMaster(tcp);
+
+            // Simulator initializes Holding[5..6] as IEEE-754 1234.5f,
+            // low-word first; diagnostic writes touch only 20..23.
+            ushort[] holding = await master.ReadHoldingRegistersAsync(unitId, 0, 17)
+                .WaitAsync(TimeSpan.FromMilliseconds(ioTimeoutMs), token);
+            if (holding.Length != 17)
+            {
+                Check(false, "FC03 response length");
+                continue;
+            }
+            if (holding[0] != 1 || holding[1] != 17 || holding[3] != 42)
+            {
+                Check(false, $"FC03 technological map changed: Measurme={holding[0]}, Status={holding[1]}, Cutoff={holding[3]}");
+                continue;
+            }
+            uint bits = (uint)holding[5] | ((uint)holding[6] << 16);
+            float speed = BitConverter.UInt32BitsToSingle(bits);
+            if (speed != 1234.5f)
+            {
+                Check(false, $"FC03 Holding Speed expected 1234.5, actual {speed}");
+                continue;
+            }
+
+            Interlocked.Increment(ref fc03Ok);
+            Log($"FC03 OK: 17 Holding Registers, Speed={speed}, Register0={holding[0]}");
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex) when (IsExpectedIoFailure(ex))
+        {
+            Interlocked.Increment(ref fc03Unavailable);
+            Log($"FC03 UNAVAILABLE: {ex.GetType().Name}: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Check(false, $"FC03 UNEXPECTED EXCEPTION: {ex}");
+        }
+    }
+}
+
 async Task WriteLoop(CancellationToken token)
 {
     using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(writePeriodMs));
@@ -238,42 +355,44 @@ async Task WriteLoop(CancellationToken token)
 
         try
         {
-            // Separate diagnostic client: do not change CoreLink transport ownership.
+            // FC03 reads Holding Registers; actual writes use FC06 and FC16.
+            // Only emulator 127.0.0.1:1502 UnitId=1 is permitted above.
             using var tcp = new TcpClient();
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
             deadline.CancelAfter(ioTimeoutMs);
             await tcp.ConnectAsync(ip, port, deadline.Token);
             using var master = new ModbusFactory().CreateMaster(tcp);
 
-            // NModbus APIs do not accept cancellation; socket is disposed on timeout.
-            await master.WriteSingleRegisterAsync(unitId, 0, word)
+            await master.WriteSingleRegisterAsync(unitId, 20, word)
                 .WaitAsync(TimeSpan.FromMilliseconds(ioTimeoutMs), token);
             Interlocked.Increment(ref singleWrites);
-            await master.WriteMultipleRegistersAsync(unitId, 1, block)
+            await master.WriteMultipleRegistersAsync(unitId, 21, block)
                 .WaitAsync(TimeSpan.FromMilliseconds(ioTimeoutMs), token);
             Interlocked.Increment(ref multipleWrites);
 
-            ushort[] got = await master.ReadHoldingRegistersAsync(unitId, 0, 4)
+            ushort[] got = await master.ReadHoldingRegistersAsync(unitId, 20, 4)
                 .WaitAsync(TimeSpan.FromMilliseconds(ioTimeoutMs), token);
-            Check(got.Length == 4, "FC03 readback length");
-            if (got.Length == 4)
-                Check(got[0] == word && got[1] == block[0] &&
-                      got[2] == block[1] && got[3] == block[2],
-                      "FC06/FC16 -> FC03 readback values");
+            bool verified = got.Length == 4 &&
+                            got[0] == word && got[1] == block[0] &&
+                            got[2] == block[1] && got[3] == block[2];
+            if (!verified)
+            {
+                Check(false, $"FC06/FC16 -> FC03 mismatch, received [{string.Join(',', got)}]");
+                continue;
+            }
+
+            Interlocked.Increment(ref writeVerified);
             Interlocked.Increment(ref writeOk);
-            Log($"WRITE OK FC06 addr0={word}; FC16 addr1..3=[{string.Join(',', block)}]; FC03 verified");
+            Log($"WRITE OK: FC06 addr20={word}; FC16 addr21..23=[{string.Join(',', block)}]; FC03 readback verified");
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
             return;
         }
-        catch (Exception ex) when (ex is SocketException or IOException or
-                                   TimeoutException or OperationCanceledException or
-                                   ObjectDisposedException ||
-                                   ex.GetType().Name.Contains("SlaveException", StringComparison.Ordinal))
+        catch (Exception ex) when (IsExpectedIoFailure(ex))
         {
             Interlocked.Increment(ref writeUnavailable);
-            Log($"WRITE/VERIFY UNAVAILABLE: {ex.GetType().Name}: {ex.Message}");
+            Log($"WRITE UNAVAILABLE: {ex.GetType().Name}: {ex.Message}");
         }
         catch (Exception ex)
         {
@@ -281,3 +400,8 @@ async Task WriteLoop(CancellationToken token)
         }
     }
 }
+
+static bool IsExpectedIoFailure(Exception ex) =>
+    ex is SocketException or IOException or TimeoutException or
+          OperationCanceledException or ObjectDisposedException ||
+    ex.GetType().Name.Contains("SlaveException", StringComparison.Ordinal);

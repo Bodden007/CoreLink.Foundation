@@ -39,6 +39,8 @@ internal static class ModbusTransportSmokeTest
             // 500 ms соответствует текущему базовому циклу polling проекта.
             PollIntervalMs = 500,
 
+            PollFunctionCode = 4,
+
             // Читаем минимальный диапазон: для smoke test важнее жизненный цикл
             // сессии и диспетчеризация запросов, чем полнота технологической карты.
             InputStartAddress = 8,

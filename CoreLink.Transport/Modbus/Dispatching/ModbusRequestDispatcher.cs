@@ -159,11 +159,16 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     ///
     /// Polling имеет приоритет ниже write, но выше одиночного чтения.
     /// </summary>
+
     public Task<ModbusReadResult> ReadPollingAsync(
         byte slaveId,
         ushort startAddress,
-        ushort count)
+        ushort count,
+        byte functionCode = 4)
     {
+        if (functionCode is not (3 or 4))
+            throw new ArgumentOutOfRangeException(nameof(functionCode));
+
         TaskCompletionSource<ModbusReadResult> completion =
             CreateCompletionSource<ModbusReadResult>();
 
@@ -172,6 +177,7 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
                 slaveId,
                 startAddress,
                 count,
+                functionCode,
                 completion));
 
         _requestSignal.Release();
@@ -179,17 +185,23 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         return completion.Task;
     }
 
+
     /// <summary>
     /// Добавляет одиночное чтение с самым низким приоритетом.
     ///
     /// Используется для операций, которые не должны задерживать
     /// штатный поток данных.
     /// </summary>
+
     public Task<ModbusReadResult> ReadSingleAsync(
         byte slaveId,
         ushort startAddress,
-        ushort count)
+        ushort count,
+        byte functionCode = 4)
     {
+        if (functionCode is not (3 or 4))
+            throw new ArgumentOutOfRangeException(nameof(functionCode));
+
         TaskCompletionSource<ModbusReadResult> completion =
             CreateCompletionSource<ModbusReadResult>();
 
@@ -198,12 +210,14 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
                 slaveId,
                 startAddress,
                 count,
+                functionCode,
                 completion));
 
         _requestSignal.Release();
 
         return completion.Task;
     }
+
 
     /// <summary>
     /// Единственная точка исполнения запросов текущей Modbus-сессии.
@@ -361,6 +375,7 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     /// Пустой массив не используется как признак отказа:
     /// status и Data передаются вызывающей стороне как единый результат.
     /// </summary>
+
     private async Task ExecuteReadAsync(
         ReadRequest request,
         CancellationToken cancellationToken)
@@ -373,17 +388,28 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         }
         else
         {
-            result =
-                await _connectionManager.ReadInputRegistersAsync(
+            result = request.FunctionCode switch
+            {
+                3 => await _connectionManager.ReadHoldingRegistersAsync(
                     request.SlaveId,
                     request.StartAddress,
                     request.Count,
-                    cancellationToken);
+                    cancellationToken),
+
+                4 => await _connectionManager.ReadInputRegistersAsync(
+                    request.SlaveId,
+                    request.StartAddress,
+                    request.Count,
+                    cancellationToken),
+
+                _ => throw new InvalidOperationException(
+                    "Unsupported Modbus read function code.")
+            };
         }
 
-        request.Completion.TrySetResult(
-            result);
+        request.Completion.TrySetResult(result);
     }
+
 
     /// <summary>
     /// Асинхронно останавливает worker.
@@ -505,11 +531,14 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     /// <summary>
     /// Внутреннее представление операции чтения.
     /// </summary>
+
     private sealed record ReadRequest(
         byte SlaveId,
         ushort StartAddress,
         ushort Count,
+        byte FunctionCode,
         TaskCompletionSource<ModbusReadResult> Completion);
+
 
     /// <summary>
     /// Внутреннее представление команды записи.

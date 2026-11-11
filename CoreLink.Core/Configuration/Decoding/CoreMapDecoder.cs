@@ -8,7 +8,7 @@ using CoreLink.Core.Configuration.Models;
 namespace CoreLink.Core.Configuration.Decoding;
 
 /// <summary>
-/// Декодирует бинарную карту CoreLink v2.
+/// Декодирует бинарную карту CoreLink v3.
 ///
 /// Преобразует бинарную конфигурацию в модель Core.
 /// Не создаёт Transport и не выполняет сетевых операций.
@@ -64,6 +64,16 @@ internal static class CoreMapDecoder
             BinaryPrimitives.ReadInt32LittleEndian(
                 buffer.Slice(offset, 4));
         offset += 4;
+
+
+        var pollFunctionCode = buffer[offset++];
+
+        if (pollFunctionCode is not (3 or 4))
+        {
+            throw new InvalidOperationException(
+                $"Unsupported polling function code: {pollFunctionCode}.");
+        }
+
 
         var connectTimeoutMs =
             BinaryPrimitives.ReadInt32LittleEndian(
@@ -150,6 +160,7 @@ internal static class CoreMapDecoder
             Port = port,
             UnitId = unitId,
             PollIntervalMs = pollIntervalMs,
+            PollFunctionCode = pollFunctionCode,
             ConnectTimeoutMs = connectTimeoutMs,
             RequestTimeoutMs = requestTimeoutMs,
             ReconnectDelayMs = reconnectDelayMs,
@@ -157,6 +168,7 @@ internal static class CoreMapDecoder
             RegisterLength = registerLength,
             RegisterOrder = registerOrder,
             Registers = registers
+            
         };
     }
 }

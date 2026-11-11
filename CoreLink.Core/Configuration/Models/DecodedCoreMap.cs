@@ -21,6 +21,13 @@ internal sealed class DecodedCoreMap
 
     public required int PollIntervalMs { get; init; }
 
+    /// <summary>
+    /// Функция чтения постоянной группы polling.
+    /// FC03 — Holding Registers.
+    /// FC04 — Input Registers.
+    /// </summary>
+    public required byte PollFunctionCode { get; init; }
+
     public required int ConnectTimeoutMs { get; init; }
 
     public required int RequestTimeoutMs { get; init; }

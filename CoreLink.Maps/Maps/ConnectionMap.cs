@@ -1,4 +1,3 @@
-
 using CoreLink.Contracts.Registers;
 
 namespace CoreLink.Maps.Maps;
@@ -19,7 +18,7 @@ internal static class ConnectionMap
     public const ushort Port = 1502;
 
     public const byte UnitId = 1;
-
+    public const byte PollFunctionCode = 3;
     public const int PollIntervalMs = 500;
 
     public const int RxIntervalMs = 500;

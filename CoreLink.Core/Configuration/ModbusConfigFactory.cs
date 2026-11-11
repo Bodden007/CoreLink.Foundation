@@ -25,6 +25,7 @@ internal static class ModbusConfigFactory
             SlaveId = map.UnitId,
 
             PollIntervalMs = map.PollIntervalMs,
+            PollFunctionCode = map.PollFunctionCode,
 
             InputStartAddress = map.StartAddress,
             InputRegisterCount = map.RegisterLength,

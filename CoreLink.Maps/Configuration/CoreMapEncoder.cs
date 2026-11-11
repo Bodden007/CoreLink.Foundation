@@ -75,6 +75,16 @@ internal static class CoreMapEncoder
             span.Slice(offset, 4),
             map.PollIntervalMs);
         offset += 4;
+        
+        // Функция чтения постоянной группы polling.
+        // Поддерживаются только FC03 и FC04.
+        if (map.PollFunctionCode is not (3 or 4))
+        {
+            throw new InvalidOperationException(
+                $"Unsupported polling function code: {map.PollFunctionCode}.");
+        }
+
+        span[offset++] = map.PollFunctionCode;
 
         BinaryPrimitives.WriteInt32LittleEndian(
             span.Slice(offset, 4),

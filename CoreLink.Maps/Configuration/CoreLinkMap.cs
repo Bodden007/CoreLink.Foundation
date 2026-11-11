@@ -14,6 +14,12 @@ internal sealed class CoreLinkMap
 
     public int PollIntervalMs { get; init; }
 
+    /// <summary>
+    /// Функция чтения постоянной группы polling.
+    /// Допустимые значения: FC03 и FC04.
+    /// </summary>
+    public byte PollFunctionCode { get; init; } = 4;
+
     public int ConnectTimeoutMs { get; init; }
 
     public int RequestTimeoutMs { get; init; }

@@ -31,6 +31,7 @@ public sealed class MapProvider : IMapProvider
             Port = ConnectionMap.Port,
             UnitId = ConnectionMap.UnitId,
 
+            PollFunctionCode = ConnectionMap.PollFunctionCode,
             PollIntervalMs = ConnectionMap.PollIntervalMs,
 
             ConnectTimeoutMs = ConnectionMap.ConnectTimeoutMs,

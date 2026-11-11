@@ -120,6 +120,39 @@ internal sealed class ModbusConnectionManager : IDisposable
         };
     }
 
+
+    /// <summary>
+    /// Читает последовательный блок Holding Registers (FC03).
+    ///
+    /// Использует существующий механизм выполнения Modbus-запросов:
+    /// сериализацию, timeout, reconnect и обработку ошибок.
+    ///
+    /// При ошибке Data == null, причина определяется Status.
+    /// </summary>
+    public async Task<ModbusReadResult> ReadHoldingRegistersAsync(
+        byte slaveId,
+        ushort startAddress,
+        ushort count,
+        CancellationToken cancellationToken = default)
+    {
+        (ModbusTransportStatus status, ushort[]? data) =
+            await ExecuteRequestAsync(
+                master => master.ReadHoldingRegistersAsync(
+                    slaveId,
+                    startAddress,
+                    count),
+                cancellationToken);
+
+        return new ModbusReadResult
+        {
+            Status = status,
+            Data = status == ModbusTransportStatus.Ok
+                ? data
+                : null
+        };
+    }
+
+
     /// <summary>
     /// Записывает один Holding Register.
     ///

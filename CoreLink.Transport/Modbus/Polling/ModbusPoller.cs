@@ -97,11 +97,14 @@ internal sealed class ModbusPoller : IAsyncDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
+
                 ModbusReadResult result =
                     await _dispatcher.ReadPollingAsync(
                         _config.SlaveId,
                         _config.InputStartAddress,
-                        _config.InputRegisterCount);
+                        _config.InputRegisterCount,
+                        _config.PollFunctionCode);
+
 
                 if (result.Status ==
                     ModbusTransportStatus.Cancelled)

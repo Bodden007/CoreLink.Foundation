@@ -25,6 +25,14 @@ public sealed class ModbusConnectionConfig
     /// Начальный адрес блока Input Registers,
     /// читаемого основным циклом polling.
     /// </summary>
+
+    /// <summary>
+    /// Функция чтения постоянной группы polling.
+    /// FC03 — Holding Registers.
+    /// FC04 — Input Registers.
+    /// </summary>
+    public required byte PollFunctionCode { get; init; }
+
     public required ushort InputStartAddress { get; init; }
 
     /// <summary>
