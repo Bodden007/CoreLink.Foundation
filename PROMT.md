@@ -36,24 +36,24 @@ Avalonia / application
 
 Нельзя создавать второй Dispatcher, переносить Modbus-адреса в Rx/UI, соединять Rx с транспортом или подменять snapshot прямым чтением. Rust/FFI и OPC UA остаются отдельными будущими задачами.
 
-## 3. Различать состояние default branch и локальную реализацию
+## 3. Различать состояние default branch и локальные испытания
 
-**На момент чтения GitHub 11.11.2026:** `ICore` в default branch содержит `Start`, `Stop`, `GetSnapshot`, `StatusChanged`; публичного `ReadAsync` там ещё не было.
+**Проверено в GitHub 11.11.2026:** `ICore` и `CoreLinkClient` уже содержат публичный `ReadAsync`; `CoreMapLayout` находится в версии 3, а `PollFunctionCode` выбирает FC03/FC04 для polling.
 
-**Локально реализовано и проверено пользователем 11.11:** `CoreLinkClient.ReadAsync(IReadOnlyList<int> valueIds)` и `ICore.ReadAsync`, адаптер и Core; `CoreReadResult` со `Status` и `float[]? Values`; типы **Word/Float**. ValueId определяет объект в карте, Float занимает два регистра. Core объединяет смежные физические диапазоны, ограниченные Modbus FC04, декодирует результат и возвращает значения в исходном порядке, в том числе повторные ValueId. При ошибке `Values=null`; недопустимый ValueId/пустой запрос дают `BadConfig`.
+**Реализовано в GitHub и проверено локально 11.11:** `CoreLinkClient.ReadAsync(IReadOnlyList<int> valueIds)` и `ICore.ReadAsync`, адаптер и Core; `CoreReadResult` со `Status` и `float[]? Values`; типы **Word/Float**. ValueId определяет объект в карте, Float занимает два регистра. Core объединяет смежные физические диапазоны, ограниченные Modbus FC04, декодирует результат и возвращает значения в исходном порядке, в том числе повторные ValueId. При ошибке `Values=null`; недопустимый ValueId/пустой запрос дают `BadConfig`.
 
-В локальном контракте `CoreReadStatus`: `Ok`, `Disconnected`, `Timeout`, `Failed`, `BadConfig`, `Stopped`. Это **не** `SnapshotStatus`, `CoreStatus` и не `CoreLinkState`. В актуальной ветке API проверять по коду, прежде чем писать новую реализацию или обновлять спецификацию как выпущенную.
+В локальном контракте `CoreReadStatus`: `Ok`, `Disconnected`, `Timeout`, `Failed`, `BadConfig`, `Stopped`. Это **не** `SnapshotStatus`, `CoreStatus` и не `CoreLinkState`. Перед дальнейшей правкой сверять API с фактическим кодом ветки.
 
-**Публичный Write API не реализован.** Наличие `ModbusTransportSession.WriteSingleRegisterAsync` / `WriteMultipleRegistersAsync` и FC06/FC16 эмулятора не означает наличия записи через Client. FC03 в проверенном CoreLink-пути Read не реализована: прямой Read использует FC04 Input Registers.
+**Публичный Write API не реализован.** Наличие `ModbusTransportSession.WriteSingleRegisterAsync` / `WriteMultipleRegistersAsync` и FC06/FC16 эмулятора не означает наличия записи через Client. FC03 доступна в штатном polling; прямой Read по ValueId пока использует FC04 Input Registers по умолчанию.
 
 ## 4. Polling, Read и Rx
 
 ```text
-PLC → FC04 polling → Core decode → internal snapshot
+PLC → FC03/FC04 polling → Core decode → internal snapshot
                                    |
 Rx → Client.ReadRxSnapshot → ICore.GetSnapshot → RxValue → application
 
-Application → Client.ReadAsync → ICore → Core → Transport Dispatcher → FC04
+Application → Client.ReadAsync → ICore → Core → Transport Dispatcher → FC04 (default)
 ```
 
 - Polling управляется `PollIntervalMs`; Rx — независимым `RxIntervalMs`. Client не создаёт собственный Modbus polling.
@@ -65,7 +65,7 @@ Application → Client.ReadAsync → ICore → Core → Transport Dispatcher →
 
 ## 5. Карта, память, единицы
 
-`CoreMap v2`: Little Endian, 33 байта заголовка, по 3 байта на запись (`ushort Address` + `byte Type`); `BufferLength` — число значений. `ValueId == index` в `RegisterMap`, не адрес Modbus. Типы `Word` и `Float`, 32-битный Float читается из двух физических регистров с учётом настроенного порядка слов/байтов.
+`CoreMap v3`: Little Endian, 34 байта заголовка, по 3 байта на запись (`ushort Address` + `byte Type`); `BufferLength` — число значений. `ValueId == index` в `RegisterMap`, не адрес Modbus. Типы `Word` и `Float`, 32-битный Float читается из двух физических регистров с учётом настроенного порядка слов/байтов.
 
 Точное имя PLC-регистра **`Measurme`**, тестовый `ValueId=8`, адрес 0. Системы 1=UA, 2=EU; 0=пустая единица; неизвестное значение=`—` и диагностика. Rx не конвертирует значения; новая система расширяется картой, без прошитых ID. Подробности в [MAP_PROMT.md](MAP_PROMT.md).
 
@@ -75,12 +75,20 @@ Application → Client.ReadAsync → ICore → Core → Transport Dispatcher →
 - FC04 прямой Read: 5/5 сценариев; стабильный тест 120/120 snapshot, 132/132 инварианта.
 - 60 с stable: 85/85 прямых Read; 28/28 диагностических циклов FC06+FC16 с FC03 readback; 120/120 snapshot.
 - 60 с с отказами: 177/177 физически начатых запросов диагностически завершены; `HungRequestCount=10`, `RecoveredRequestCount=10`; Read и Rx восстановились после TCP OFFLINE и HANG FC04; инвариантов нарушено 0.
-- `Stop` при окончании испытания успешно завершён примерно за 2048 мс; считать миллисекундную остановку гарантией нельзя.
+- `Stop` при одном раннем отказовом испытании завершён примерно за 2048 мс; в последних прогонах FC04/FC03 остановка занимала 3,2/4,1 мс. Это не гарантированная верхняя граница.
 
 Пояснение: `RecoveredRequestCount` отмечает завершение **старой NModbus Task после закрытия TCP при timeout**, не количество успешно восстановленных соединений. `RequestCompletedCount` после локального исправления считает и неуспешные физические запросы. Стресс-запись шла через **другое TCP-соединение**, не CoreLink Dispatcher.
 
 ## 7. Не реализовано / не выдавать за доказанное
 
-Публичный FC03/FC06/FC16 Read Holding/Write через `Client → ICore → Core → Transport`; подтверждённый приоритет Write в едином Dispatcher; промышленный PLC; полная поддержка всех порядков Float; production-логгер; NativeAOT publish; доказанный предел Stop при любом зависании; Rust/OPC UA.
+Публичный прямой FC03 Read Holding и FC06/FC16 Write через `Client → ICore → Core → Transport`; подтверждённый приоритет Write в едином Dispatcher; промышленный PLC; полная поддержка всех порядков Float; production-логгер; NativeAOT publish; доказанный предел Stop при любом зависании; Rust/OPC UA.
 
 За действующей реализацией следить по коду; локальные результаты не подменяют merge или push.
+
+## 8. Обновление по реализации и тестам 11.11.2026
+
+Текущий GitHub: `CoreMap v3` (`Version=3`, `HeaderSize=34`, один байт FC после `PollIntervalMs`); Poller и Dispatcher направляют polling на FC03 либо FC04. `ConnectionMap.PollFunctionCode=3`. Публичный `ReadAsync(ValueIds)` присутствует, но чтение в нём по-прежнему FC04 по умолчанию. Не смешивать конфигурацию polling с выбором функции для прямого Read.
+
+Локальные результаты последних 60-секундных отказовых прогонов: FC04 polling — 81/120 Snapshot, 59/66 ReadAsync, Stop 3,2 мс; FC03 polling после изоляции диагностических HR20–23 — 67/120 Snapshot, 49/58 ReadAsync, 154/154 завершённых физических запросов и Stop 4,1 мс; по 0 нарушений проверяемых инвариантов. `Unknown Measurme` до изоляции был вызван записью теста в HR0 и не являлся дефектом транспортного механизма.
+
+**Решение по объёму работ:** публичную запись и тесты записи пока отложить. Далее — единый сценарий чтения: FC03/FC04 polling, прямые чтения через один CoreLink Dispatcher, ValueId/Word/Float, OFFLINE/HANG/RECOVERY, Rx/snapshot, lifecycle, единый PASS/FAIL. Не выдавать диагностические запросы NModbus через отдельный TCP за проверку публичного CoreLink API. Исправления проводить точечно, без попутного рефакторинга.
