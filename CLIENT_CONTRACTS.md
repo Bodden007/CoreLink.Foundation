@@ -6,7 +6,7 @@
 
 Client — единая публичная точка приложения. Он владеет lifecycle, двумя буферами snapshot и Rx; **не** реализует Modbus polling, декодирование или выбор единиц. Путь: `Client → ICore → Adapter.CSharp → Core → Transport → PLC`. Rx получает snapshot только через Client.
 
-## API в default branch на момент актуализации
+## API в актуальной ветке GitHub
 
 ```csharp
 CoreLinkClient(IMapProvider mapProvider, ICore core);
@@ -20,9 +20,9 @@ IObservable<RxValue>? Values;
 IObservable<SnapshotStatus>? Statuses;
 ```
 
-`ICore` содержит `Start(CoreMap)`, `Stop()`, `GetSnapshot(float*, int)`, `StatusChanged`. `ReadAsync` пока отсутствует в считанных исходниках default branch.
+`ICore` содержит `Start(CoreMap)`, `Stop()`, `GetSnapshot(float*, int)`, `ReadAsync(IReadOnlyList<int>)`, `StatusChanged`. Чтение уже есть в исходниках GitHub.
 
-## Локально реализованный ReadAsync — 11.11.2026
+## Реализованный ReadAsync — 11.11.2026
 
 ```csharp
 Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
@@ -30,11 +30,11 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 
 Проведён через `Client → ICore → Adapter.CSharp → Core → Transport → Dispatcher` (FC04). `CoreReadResult.Status` — `CoreReadStatus`: `Ok`, `Disconnected`, `Timeout`, `Failed`, `BadConfig`, `Stopped`. `Values` — отдельный `float[]` при успехе, `null` при ошибке; значения соответствуют запрошенному порядку ValueId. Допускаются повторы, блочные и разрозненные значения. Пустой/неверный запрос даёт `BadConfig`; после Stop — `Stopped`.
 
-**Доказано локальными тестами**, но перед вызовом в коде из GitHub необходимо проверить наличие изменений в соответствующей ветке. `ReadAsync` не читает snapshot и не публикует Rx-события сам по себе.
+**Есть в GitHub и проверен локально.** `ReadAsync` не читает snapshot и не публикует Rx-события сам по себе.
 
 ## Циклы и память
 
-- `PollIntervalMs` управляет штатным FC04 polling; `RxIntervalMs` — отдельный цикл Rx.
+- `PollIntervalMs` управляет штатным polling FC03/FC04, выбираемым `PollFunctionCode`; `RxIntervalMs` — отдельный цикл Rx.
 - `GetSnapshot` закрепляет клиентский буфер `fixed` только на время `ICore.GetSnapshot`. Нельзя сохранять указатель в Core.
 - `_coreBuffer` и `_rxBuffer` — отдельные массивы. Возвращаемый публичный `ReadOnlyMemory<float>` ссылается на повторно используемый буфер и может измениться после следующего вызова.
 - Успех Read не означает автоматическое обновление snapshot. Свежесть данных и lifecycle не смешивать.
@@ -43,7 +43,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 
 `Start` загружает Core/Rx-карты, проверяет их согласованность и запускает Core и Rx. `StopAsync` сначала останавливает Rx, затем Core; конкурентные Stop объединены в одну Task. После `Stopped` повторный Start на том же экземпляре не предусмотрен.
 
-Не смешивать `CoreStatus` (Core), `CoreLinkState` (Client), `SnapshotStatus` (snapshot) и `CoreReadStatus` (локальная операция Read). `Running` не значит наличие актуальных данных. Ошибка внутреннего компонента не должна превращаться в `NoData` или ложный успех.
+Не смешивать `CoreStatus` (Core), `CoreLinkState` (Client), `SnapshotStatus` (snapshot) и `CoreReadStatus` (операция Read). `Running` не значит наличие актуальных данных. Ошибка внутреннего компонента не должна превращаться в `NoData` или ложный успех.
 
 ## Запись
 
@@ -56,3 +56,11 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 Открыто: публичная запись, lifecycle со сложными гонками и гарантия верхней границы Stop, полный NativeAOT, промышленный логгер, аппаратный PLC и проверка всех byte/word order.
 
 Дополнительно: [RX_CONTRACTS.md](RX_CONTRACTS.md), [MAP_PROMT.md](MAP_PROMT.md), [PROMT.md](PROMT.md).
+
+## Уточнение FC03/FC04 и актуальные испытания
+
+`PollFunctionCode` входит в бинарную CoreMap v3 и выбирает FC03 или FC04 **для штатного polling**. Публичный `ReadAsync(ValueIds)` остаётся чтением через FC04 по умолчанию; не приписывать его сигнатуре выбор функции Modbus. Внутренний Dispatcher умеет маршрутизировать оба кода, но публичный отдельный FC03/FC04 Read API ещё не согласован и не реализован.
+
+11.11.2026 локально выполнены циклы FC04/FC03 polling с OFFLINE, HANG и RECOVERY. После разделения тестовых адресов Holding Registers на `0–16` (технологические) и `20–23` (диагностическая запись) исчезли ошибки `Unknown Measurme`. Последний FC03 прогон: Snapshot 67/120, ReadAsync 49/58, 154/154 завершённых физических запросов, 0 нарушений тестовых инвариантов, Stop `Ok` за 4,1 мс.
+
+**Публичная запись не реализована; разработка и тестирование записи временно отложены.** Последующие изменения исправлять точечно после завершения чтения и единого сценария тестирования.
