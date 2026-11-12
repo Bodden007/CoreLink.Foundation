@@ -1,4 +1,3 @@
-
 using System.Diagnostics;
 using CoreLink.Client.Configuration;
 using CoreLink.Client.Lifecycle;
@@ -8,6 +7,7 @@ using CoreLink.Contracts.Maps;
 using CoreLink.Rx.Runtime;
 using CoreLink.Contracts.Registers;
 using System.Buffers.Binary;
+using System.Reactive.Linq;
 
 namespace CoreLink.Client;
 
@@ -799,5 +799,51 @@ public sealed class CoreLinkClient
             SetWriteStatus(CoreWriteStatus.Failed);
         }
     }
+
+    /// <summary>
+    /// Возвращает поток изменений параметра по ValueId.
+    ///
+    /// Подписчик получает только последующие изменения.
+    /// Последнее известное значение не воспроизводится.
+    /// Не создаёт дополнительных запросов к Core.
+    ///
+    /// При ошибке возвращает пустой поток.
+    /// Исключения наружу не передаются.
+    /// </summary>
+    public IObservable<RxValue> ObserveValue(int valueId)
+    {
+        try
+        {
+            lock (_lifecycleLock)
+            {
+                if (_state != CoreLinkState.Running ||
+                    _rx is null ||
+                    _coreMap is null)
+                {
+                    // TODO: Добавить централизованное логирование.
+                    // Причина: Client или Rx недоступен.
+                    return Observable.Empty<RxValue>();
+                }
+
+                if ((uint)valueId >=
+                    (uint)_coreMap.BufferLength)
+                {
+                    // TODO: Добавить централизованное логирование.
+                    // Причина: некорректный ValueId.
+                    return Observable.Empty<RxValue>();
+                }
+
+                return _rx.Values.Where(
+                    value => value.ValueId == valueId);
+            }
+        }
+        catch (Exception)
+        {
+            // TODO: Добавить централизованное логирование.
+            // Причина: ошибка формирования подписки.
+            return Observable.Empty<RxValue>();
+        }
+    }
+
 
 }
