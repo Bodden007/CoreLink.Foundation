@@ -53,6 +53,38 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     /// </summary>
     private readonly SemaphoreSlim _requestSignal = new(0);
 
+    /// <summary>
+    /// Синхронизирует изменение состояния Dispatcher
+    /// с постановкой новых запросов в очереди.
+    /// </summary>
+    private readonly object _lifecycleLock = new();
+
+    /// <summary>
+    /// Разрешена ли постановка запросов.
+    /// При Stop устанавливается false до отмены worker.
+    /// </summary>
+    private bool _acceptingRequests;
+
+
+    /// <summary>
+    /// Общая задача остановки Dispatcher.
+    /// Конкурентные StopAsync() ожидают один и тот же worker,
+    /// не выполняя повторную отмену и освобождение CTS.
+    /// </summary>
+    private Task? _stopTask;
+
+    /// <summary>
+    /// Общая задача освобождения ресурсов Dispatcher.
+    /// Гарантирует однократное освобождение _requestSignal.
+    /// </summary>
+    private Task? _disposeTask;
+
+    /// <summary>
+    /// Признак начала окончательного освобождения Dispatcher.
+    /// После DisposeAsync() повторный Start запрещён.
+    /// </summary>
+    private bool _disposed;
+
     private CancellationTokenSource? _workerCts;
     private Task? _workerTask;
 
@@ -82,52 +114,101 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         _connectionManager = connectionManager;
     }
 
+
     /// <summary>
     /// Запускает единственный worker обработки Modbus-запросов.
     ///
-    /// Повторный вызов Start ничего не делает.
+    /// Повторный Start работающего Dispatcher ничего не делает.
+    /// После штатного Stop допускается повторный запуск.
+    /// После Dispose запуск запрещён.
     /// </summary>
     public void Start()
     {
-        if (IsRunning)
-            return;
+        lock (_lifecycleLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
-        _workerCts = new CancellationTokenSource();
+            // Запрещаем новый запуск, пока предыдущий worker
+            // ещё проходит процедуру остановки.
+            if (_stopTask is { IsCompleted: false })
+            {
+                throw new InvalidOperationException(
+                    "Modbus dispatcher is stopping.");
+            }
 
-        _workerTask = WorkerAsync(
-            _workerCts.Token);
+            if (_workerTask is not null)
+                return;
+
+            // Предыдущий Stop полностью завершён.
+            // Новая сессия получает собственный CTS и worker.
+            _stopTask = null;
+
+            _workerCts = new CancellationTokenSource();
+
+            _workerTask = WorkerAsync(
+                _workerCts.Token);
+
+            _acceptingRequests = true;
+        }
     }
 
     /// <summary>
-    /// Добавляет запись одного Holding Register
-    /// в высокоприоритетную очередь.
+    /// Добавляет команду записи одного Holding Register
+    /// в высокоприоритетную очередь Dispatcher.
+    ///
+    /// Проверка состояния и постановка запроса выполняются
+    /// под общим lifecycle-lock. Это исключает ситуацию,
+    /// когда worker уже остановлен, а запрос остаётся
+    /// в очереди с незавершённым TaskCompletionSource.
+    ///
+    /// Если Dispatcher не принимает запросы, возвращается
+    /// результат со статусом Cancelled.
     /// </summary>
     public Task<ModbusWriteResult> WriteSingleRegisterAsync(
         byte slaveId,
         ushort address,
         ushort value)
     {
-        TaskCompletionSource<ModbusWriteResult> completion =
-            CreateCompletionSource<ModbusWriteResult>();
+        lock (_lifecycleLock)
+        {
+            // StopAsync() закрывает приём запросов под тем же lock.
+            // После остановки создавать новую операцию запрещено.
+            if (!_acceptingRequests)
+                return Task.FromResult(CreateCancelledWriteResult());
 
-        _writeRequests.Enqueue(
-            WriteRequest.CreateSingle(
-                slaveId,
-                address,
-                value,
-                completion));
+            // Каждый запрос имеет собственный CompletionSource.
+            // RunContinuationsAsynchronously предотвращает выполнение
+            // пользовательского продолжения внутри worker.
+            TaskCompletionSource<ModbusWriteResult> completion =
+                CreateCompletionSource<ModbusWriteResult>();
 
-        _requestSignal.Release();
+            _writeRequests.Enqueue(
+                WriteRequest.CreateSingle(
+                    slaveId,
+                    address,
+                    value,
+                    completion));
 
-        return completion.Task;
+            // Сигнал и постановка в очередь находятся под одним lock.
+            // Stop не сможет вклиниться между ними.
+            _requestSignal.Release();
+
+            return completion.Task;
+        }
     }
 
     /// <summary>
-    /// Добавляет запись блока Holding Registers
-    /// в высокоприоритетную очередь.
+    /// Добавляет команду записи нескольких Holding Registers
+    /// в высокоприоритетную очередь Dispatcher.
     ///
-    /// Массив копируется при постановке в очередь, чтобы вызывающая
-    /// сторона не могла изменить данные до фактической отправки.
+    /// Исходный массив копируется до постановки запроса,
+    /// поскольку вызывающая сторона сохраняет владение
+    /// переданным массивом и может изменить его содержимое.
+    ///
+    /// Проверка состояния, копирование и постановка запроса
+    /// выполняются под lifecycle-lock.
+    ///
+    /// При остановленном Dispatcher возвращается Cancelled.
     /// </summary>
     public Task<ModbusWriteResult> WriteMultipleRegistersAsync(
         byte slaveId,
@@ -136,63 +217,100 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(values);
 
-        TaskCompletionSource<ModbusWriteResult> completion =
-            CreateCompletionSource<ModbusWriteResult>();
+        lock (_lifecycleLock)
+        {
+            // Не создаём запрос, который некому выполнить.
+            if (!_acceptingRequests)
+                return Task.FromResult(CreateCancelledWriteResult());
 
-        ushort[] valuesCopy =
-            (ushort[])values.Clone();
+            TaskCompletionSource<ModbusWriteResult> completion =
+                CreateCompletionSource<ModbusWriteResult>();
 
-        _writeRequests.Enqueue(
-            WriteRequest.CreateMultiple(
-                slaveId,
-                startAddress,
-                valuesCopy,
-                completion));
+            // Снимок данных на момент постановки команды.
+            // Последующие изменения исходного массива
+            // не повлияют на отправляемые значения.
+            ushort[] valuesCopy = (ushort[])values.Clone();
 
-        _requestSignal.Release();
+            _writeRequests.Enqueue(
+                WriteRequest.CreateMultiple(
+                    slaveId,
+                    startAddress,
+                    valuesCopy,
+                    completion));
 
-        return completion.Task;
+            // Будим единственный worker.
+            // Приоритет записи определяется TryExecuteNextAsync().
+            _requestSignal.Release();
+
+            return completion.Task;
+        }
     }
 
     /// <summary>
-    /// Добавляет штатное чтение polling.
+    /// Добавляет штатный polling-запрос в очередь Dispatcher.
     ///
-    /// Polling имеет приоритет ниже write, но выше одиночного чтения.
+    /// Поддерживаются:
+    /// FC03 — Read Holding Registers;
+    /// FC04 — Read Input Registers.
+    ///
+    /// Polling имеет приоритет ниже write, но выше single read.
+    /// Существующий алгоритм распределения приоритетов
+    /// не изменяется.
+    ///
+    /// При остановке Dispatcher возвращается Cancelled.
     /// </summary>
-
     public Task<ModbusReadResult> ReadPollingAsync(
         byte slaveId,
         ushort startAddress,
         ushort count,
         byte functionCode = 4)
     {
+        // Ошибка конфигурации должна выявляться сразу.
+        // Lifecycle-проверка не заменяет валидацию аргументов.
         if (functionCode is not (3 or 4))
             throw new ArgumentOutOfRangeException(nameof(functionCode));
 
-        TaskCompletionSource<ModbusReadResult> completion =
-            CreateCompletionSource<ModbusReadResult>();
+        lock (_lifecycleLock)
+        {
+            // Исключаем enqueue после завершения worker.
+            // Это гарантирует, что polling не останется
+            // в бесконечном ожидании CompletionSource.
+            if (!_acceptingRequests)
+                return Task.FromResult(CreateCancelledReadResult());
 
-        _pollRequests.Enqueue(
-            new ReadRequest(
-                slaveId,
-                startAddress,
-                count,
-                functionCode,
-                completion));
+            TaskCompletionSource<ModbusReadResult> completion =
+                CreateCompletionSource<ModbusReadResult>();
 
-        _requestSignal.Release();
+            _pollRequests.Enqueue(
+                new ReadRequest(
+                    slaveId,
+                    startAddress,
+                    count,
+                    functionCode,
+                    completion));
 
-        return completion.Task;
+            // Worker самостоятельно выбирает момент выполнения
+            // с учётом приоритетов остальных очередей.
+            _requestSignal.Release();
+
+            return completion.Task;
+        }
     }
 
-
     /// <summary>
-    /// Добавляет одиночное чтение с самым низким приоритетом.
+    /// Добавляет одиночное чтение регистров
+    /// в низкоприоритетную очередь Dispatcher.
     ///
-    /// Используется для операций, которые не должны задерживать
-    /// штатный поток данных.
+    /// Поддерживаются FC03 и FC04.
+    ///
+    /// Одиночное чтение не прерывает текущий запрос
+    /// и не изменяет период штатного polling.
+    ///
+    /// Состояние Dispatcher проверяется атомарно
+    /// относительно постановки запроса в очередь.
+    ///
+    /// При остановке возвращается статус Cancelled.
     /// </summary>
-
     public Task<ModbusReadResult> ReadSingleAsync(
         byte slaveId,
         ushort startAddress,
@@ -202,20 +320,32 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         if (functionCode is not (3 or 4))
             throw new ArgumentOutOfRangeException(nameof(functionCode));
 
-        TaskCompletionSource<ModbusReadResult> completion =
-            CreateCompletionSource<ModbusReadResult>();
+        lock (_lifecycleLock)
+        {
+            // После StopAsync() очередь больше не обслуживается.
+            // Поэтому возвращаем готовый результат Cancelled,
+            // не создавая зависший TaskCompletionSource.
+            if (!_acceptingRequests)
+                return Task.FromResult(CreateCancelledReadResult());
 
-        _singleReadRequests.Enqueue(
-            new ReadRequest(
-                slaveId,
-                startAddress,
-                count,
-                functionCode,
-                completion));
+            TaskCompletionSource<ModbusReadResult> completion =
+                CreateCompletionSource<ModbusReadResult>();
 
-        _requestSignal.Release();
+            _singleReadRequests.Enqueue(
+                new ReadRequest(
+                    slaveId,
+                    startAddress,
+                    count,
+                    functionCode,
+                    completion));
 
-        return completion.Task;
+            // Сигнализация выполняется до освобождения lock,
+            // чтобы StopAsync() не мог закрыть приём запросов
+            // посередине операции постановки.
+            _requestSignal.Release();
+
+            return completion.Task;
+        }
     }
 
 
@@ -248,10 +378,26 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         {
             // Штатное завершение worker.
         }
+
         finally
         {
-            CompletePendingRequestsAsCancelled();
+            lock (_lifecycleLock)
+            {
+                // Закрываем приём запросов независимо от причины
+                // завершения worker: Stop, отмена или исключение.
+                //
+                // Проверка _acceptingRequests и Enqueue используют
+                // тот же lock, поэтому после его установки в false
+                // ни один новый запрос не попадёт в очереди.
+                _acceptingRequests = false;
+
+                // Завершаем все необработанные запросы.
+                // Очистка выполняется под тем же lock, исключая
+                // появление новой записи после последнего Dequeue.
+                CompletePendingRequestsAsCancelled();
+            }
         }
+
     }
 
     /// <summary>
@@ -465,48 +611,84 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     }
 
 
+    /// <summary>
+    /// Останавливает Dispatcher и запрещает новые запросы.
+    ///
+    /// Конкурентные вызовы используют общую задачу остановки.
+    /// Повторное освобождение CancellationTokenSource исключено.
+    /// </summary>
+    public Task StopAsync()
+    {
+        lock (_lifecycleLock)
+        {
+            // Запрет постановки устанавливается до отмены worker.
+            // Все новые запросы получат статус Cancelled.
+            _acceptingRequests = false;
+
+            // Если остановка уже началась, ожидаем её результат.
+            if (_stopTask is not null)
+                return _stopTask;
+
+            if (_workerCts is null)
+                return Task.CompletedTask;
+
+            // Создаём одну задачу для всех конкурентных StopAsync().
+            _stopTask = StopCoreAsync(
+                _workerCts,
+                _workerTask);
+
+            return _stopTask;
+        }
+    }
 
     /// <summary>
-    /// Асинхронно останавливает worker.
+    /// Выполняет фактическую остановку единственного worker.
     ///
-    /// Уже выполняющийся transport-запрос завершается по обычным
-    /// правилам cancellation/timeout. Оставшиеся очереди завершаются
-    /// детерминированным статусом Cancelled.
+    /// CancellationTokenSource освобождается только после
+    /// завершения worker. Состояние Dispatcher очищается
+    /// под общим lifecycle-lock.
     /// </summary>
-    public async Task StopAsync()
+    private async Task StopCoreAsync(
+        CancellationTokenSource workerCts,
+        Task? workerTask)
     {
-        if (_workerCts is null)
-            return;
-
-        CancellationTokenSource workerCts =
-            _workerCts;
-
-        Task? workerTask =
-            _workerTask;
-
-        workerCts.Cancel();
-
-        if (workerTask is not null)
+        try
         {
-            try
+            // Отменяем текущую операцию через существующий
+            // CancellationToken. Новых запросов уже не принимаем.
+            workerCts.Cancel();
+
+            if (workerTask is not null)
             {
-                await workerTask;
-            }
-            catch (OperationCanceledException)
-            {
-                // Защитный catch для lifecycle worker.
-                // Пользовательские transport-запросы при этом
-                // завершаются через ModbusTransportStatus.Cancelled.
+                try
+                {
+                    await workerTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                    when (workerCts.IsCancellationRequested)
+                {
+                    // Штатная отмена lifecycle.
+                }
             }
         }
+        finally
+        {
+            lock (_lifecycleLock)
+            {
+                // Защита от изменения состояния другой сессии.
+                if (ReferenceEquals(_workerCts, workerCts))
+                {
+                    _workerCts = null;
+                    _workerTask = null;
+                    _writeGrantedBeforePendingPoll = false;
+                }
 
-        workerCts.Dispose();
-
-        _workerCts = null;
-        _workerTask = null;
-
-        _writeGrantedBeforePendingPoll = false;
+                // Освобождение принадлежит только этой процедуре.
+                workerCts.Dispose();
+            }
+        }
     }
+
 
     /// <summary>
     /// Завершает все запросы, оставшиеся в очередях после остановки.
@@ -572,16 +754,54 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
             TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
-    /// <summary>
-    /// Асинхронно завершает dispatcher и освобождает
-    /// принадлежащий ему примитив сигнализации.
-    /// </summary>
-    public async ValueTask DisposeAsync()
-    {
-        await StopAsync();
 
-        _requestSignal.Dispose();
+    /// <summary>
+    /// Окончательно освобождает Dispatcher.
+    ///
+    /// Одновременные вызовы DisposeAsync() используют одну
+    /// задачу завершения. Повторное освобождение SemaphoreSlim
+    /// и создание нового worker после Dispose исключены.
+    /// </summary>
+    public ValueTask DisposeAsync()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_disposeTask is null)
+            {
+                // Запрещаем Start ещё до начала асинхронной
+                // процедуры освобождения ресурсов.
+                _disposed = true;
+                _acceptingRequests = false;
+
+                _disposeTask = DisposeCoreAsync();
+            }
+
+            return new ValueTask(_disposeTask);
+        }
     }
+
+    /// <summary>
+    /// Останавливает worker перед освобождением сигнализации.
+    ///
+    /// Dispatcher не освобождает ModbusConnectionManager:
+    /// его lifetime принадлежит ModbusTransportSession.
+    /// </summary>
+    private async Task DisposeCoreAsync()
+    {
+        try
+        {
+            // Используем существующую общую процедуру Stop.
+            // Она ожидает завершения worker и очистки очередей.
+            await StopAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            // Новые запросы запрещены флагом _disposed.
+            // Worker уже завершён после StopAsync().
+            _requestSignal.Dispose();
+        }
+    }
+
 
     /// <summary>
     /// Внутреннее представление операции чтения.
