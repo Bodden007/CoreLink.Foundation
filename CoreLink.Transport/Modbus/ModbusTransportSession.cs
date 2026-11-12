@@ -90,17 +90,30 @@ public sealed class ModbusTransportSession : IAsyncDisposable
             values);
     }
 
+
+    /// <summary>
+    /// Выполняет прямое чтение через общий Dispatcher.
+    ///
+    /// FC03 — Holding Registers.
+    /// FC04 — Input Registers.
+    ///
+    /// Не создаёт нового TCP-соединения.
+    /// Не изменяет штатный polling.
+    /// </summary>
     public Task<ModbusReadResult> ReadSingleAsync(
         ushort startAddress,
-        ushort count)
+        ushort count,
+        byte functionCode = 4)
     {
         ThrowIfNotAvailable();
 
         return _dispatcher.ReadSingleAsync(
             GetSlaveId(),
             startAddress,
-            count);
+            count,
+            functionCode);
     }
+
 
     private void OnRegistersReceived(ushort[] registers)
     {

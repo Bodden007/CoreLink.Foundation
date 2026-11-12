@@ -1,4 +1,4 @@
-
+using CoreLink.Contracts.Registers;
 using CoreLink.Contracts.Maps;
 
 namespace CoreLink.Contracts.Core;
@@ -57,11 +57,35 @@ public unsafe interface ICore
     Task<CoreReadResult> ReadAsync(
         IReadOnlyList<int> valueIds);
 
+
+    /// <summary>
+    /// Выполняет одиночное адресное чтение PLC.
+    ///
+    /// Address — логический адрес регистра,
+    /// не ValueId из карты polling.
+    ///
+    /// Word занимает один регистр,
+    /// Float — два последовательных регистра.
+    ///
+    /// Функция FC03/FC04 выбирается явно.
+    /// Чтение проходит через существующий Dispatcher.
+    ///
+    /// Snapshot и Rx не изменяются.
+    /// Ошибки возвращаются через CoreReadStatus.
+    /// </summary>
+    Task<CoreSingleReadResult> ReadSingleAsync(
+        ushort address,
+        RegisterType type,
+        ModbusReadFunction function);
+
+
     /// <summary>
     /// Уведомляет об изменении состояния Core.
     /// </summary>
     event Action<CoreStatus>? StatusChanged;
 }
+
+
 
 /// <summary>
 /// Результат синхронного получения snapshot.

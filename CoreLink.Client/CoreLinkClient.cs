@@ -6,6 +6,7 @@ using CoreLink.Client.Results;
 using CoreLink.Contracts.Core;
 using CoreLink.Contracts.Maps;
 using CoreLink.Rx.Runtime;
+using CoreLink.Contracts.Registers;
 
 namespace CoreLink.Client;
 
@@ -511,4 +512,91 @@ public sealed class CoreLinkClient
             // Ошибки диагностики не должны нарушать Client.
         }
     }
+
+
+    // Последний результат одиночного Read.
+    // Диагностическое состояние Client,
+    // не состояние соединения или snapshot.
+    private int _lastSingleReadStatus =
+        (int)CoreReadStatus.Stopped;
+
+    /// <summary>
+    /// Последний статус одиночного чтения.
+    /// Запрашивается потребителем при необходимости.
+    /// </summary>
+    public CoreReadStatus LastSingleReadStatus =>
+        (CoreReadStatus)Volatile.Read(
+            ref _lastSingleReadStatus);
+
+    /// <summary>
+    /// Выполняет одиночное чтение PLC.
+    ///
+    /// Новое значение передаётся потребителю
+    /// исключительно при успешном статусе Core.
+    ///
+    /// При ошибке существующее значение не изменяется.
+    /// Snapshot и Rx не затрагиваются.
+    ///
+    /// Все ошибки обрабатываются внутри Client.
+    /// </summary>
+    public async Task ReadSingleAsync(
+        ushort address,
+        RegisterType type,
+        ModbusReadFunction function,
+        Action<float> updateValue)
+    {
+        lock (_lifecycleLock)
+        {
+            if (_state != CoreLinkState.Running)
+            {
+                SetSingleReadStatus(CoreReadStatus.Stopped);
+                return;
+            }
+        }
+
+        if (updateValue is null)
+        {
+            SetSingleReadStatus(CoreReadStatus.BadConfig);
+            return;
+        }
+
+        try
+        {
+            CoreSingleReadResult result =
+                await _core.ReadSingleAsync(
+                    address,
+                    type,
+                    function)
+                .ConfigureAwait(false);
+
+            SetSingleReadStatus(result.Status);
+
+            if (result.Status != CoreReadStatus.Ok)
+                return;
+
+            // Только успешный результат имеет право
+            // изменять значение потребителя.
+            updateValue(result.Value);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить централизованное
+            // логирование ошибок Single Read Client.
+            ReportError("Single Read failed.", ex);
+
+            SetSingleReadStatus(CoreReadStatus.Failed);
+        }
+    }
+
+    /// <summary>
+    /// Сохраняет диагностический статус последней
+    /// операции одиночного чтения.
+    /// </summary>
+    private void SetSingleReadStatus(CoreReadStatus status)
+    {
+        Volatile.Write(
+            ref _lastSingleReadStatus,
+            (int)status);
+    }
+
 }

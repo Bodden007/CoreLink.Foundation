@@ -865,4 +865,133 @@ public sealed class CoreLinkCore
             _state = status;
         }
     }
+
+
+    /// <summary>
+    /// Выполняет одиночное чтение Word или Float32.
+    ///
+    /// Использует действующую транспортную сессию
+    /// и существующий механизм декодирования Core.
+    ///
+    /// При ошибке возвращает статус без успешного
+    /// значения. Snapshot и Rx не изменяет.
+    ///
+    /// Штатные ошибки не пробрасываются вызывающему коду.
+    /// </summary>
+    public async Task<CoreSingleReadResult> ReadSingleAsync(
+        ushort address,
+        RegisterType type,
+        ModbusReadFunction function)
+    {
+        // Проверяем параметры до обращения к Transport.
+        int registerCount = GetRegisterLength(type);
+
+        if (registerCount == 0 ||
+            function is not (
+                ModbusReadFunction.HoldingRegisters or
+                ModbusReadFunction.InputRegisters) ||
+            (uint)address + (uint)registerCount > 65536u)
+        {
+            return new CoreSingleReadResult(
+                CoreReadStatus.BadConfig,
+                default);
+        }
+
+        ModbusTransportSession session;
+        RegisterOrder order;
+
+        lock (_snapshotLock)
+        {
+            if (_stopping ||
+                _transport is null ||
+                _map is null)
+            {
+                return new CoreSingleReadResult(
+                    CoreReadStatus.Stopped,
+                    default);
+            }
+
+            session = _transport;
+            order = _map.RegisterOrder;
+        }
+
+        try
+        {
+            ModbusReadResult result =
+                await session.ReadSingleAsync(
+                    address,
+                    (ushort)registerCount,
+                    (byte)function)
+                .ConfigureAwait(false);
+
+            if (IsStopping())
+            {
+                return new CoreSingleReadResult(
+                    CoreReadStatus.Stopped,
+                    default);
+            }
+
+            if (result.Status != ModbusTransportStatus.Ok)
+            {
+                return new CoreSingleReadResult(
+                    MapReadStatus(result.Status),
+                    default);
+            }
+
+            ushort[]? registers = result.Data;
+
+            if (registers is null ||
+                registers.Length != registerCount ||
+                !TryDecodeValue(
+                    registers,
+                    0,
+                    type,
+                    order,
+                    out float value))
+            {
+                return new CoreSingleReadResult(
+                    CoreReadStatus.Failed,
+                    default);
+            }
+
+            return new CoreSingleReadResult(
+                CoreReadStatus.Ok,
+                value);
+        }
+        catch (ObjectDisposedException ex)
+        {
+            // TODO: Подключить логирование завершения
+            // операции во время остановки Transport.
+            ReportReadError(ex);
+
+            return new CoreSingleReadResult(
+                IsStopping()
+                    ? CoreReadStatus.Stopped
+                    : CoreReadStatus.Failed,
+                default);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // TODO: Подключить логирование
+            // некорректного состояния транспортной сессии.
+            ReportReadError(ex);
+
+            return new CoreSingleReadResult(
+                IsStopping()
+                    ? CoreReadStatus.Stopped
+                    : CoreReadStatus.Failed,
+                default);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить централизованное
+            // логирование неожиданных ошибок Core.
+            ReportReadError(ex);
+
+            return new CoreSingleReadResult(
+                CoreReadStatus.Failed,
+                default);
+        }
+    }
+
 }
