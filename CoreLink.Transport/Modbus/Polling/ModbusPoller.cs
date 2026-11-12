@@ -90,21 +90,29 @@ internal sealed class ModbusPoller : IAsyncDisposable
     /// Неуспешный запрос публикуется как ModbusTransportStatus
     /// и не завершает основной цикл.
     /// </summary>
+
+    /// <summary>
+    /// Выполняет последовательный polling Modbus-регистров.
+    ///
+    /// Каждый запрос полностью завершается перед следующим циклом.
+    /// Ошибки одного цикла не останавливают polling и не препятствуют
+    /// последующему восстановлению соединения.
+    ///
+    /// Reconnect остаётся ответственностью ModbusConnectionManager.
+    /// </summary>
     private async Task PollAsync(
         CancellationToken cancellationToken)
     {
-        try
+        while (!cancellationToken.IsCancellationRequested)
         {
-            while (!cancellationToken.IsCancellationRequested)
+            try
             {
-
                 ModbusReadResult result =
                     await _dispatcher.ReadPollingAsync(
                         _config.SlaveId,
                         _config.InputStartAddress,
                         _config.InputRegisterCount,
                         _config.PollFunctionCode);
-
 
                 if (result.Status ==
                     ModbusTransportStatus.Cancelled)
@@ -114,38 +122,67 @@ internal sealed class ModbusPoller : IAsyncDisposable
                 }
                 else if (result.Ok)
                 {
-                    ushort[]? registers =
-                        result.Data;
+                    ushort[]? registers = result.Data;
 
                     if (registers is not null &&
                         registers.Length > 0)
                     {
-                        RegistersReceived?.Invoke(
-                            registers);
+                        RegistersReceived?.Invoke(registers);
                     }
                 }
                 else
                 {
-                    // Потеря связи или ошибка Modbus-запроса
-                    // является обычным состоянием Transport.
-                    //
-                    // Poller не выполняет reconnect самостоятельно:
-                    // следующий запрос снова проходит через Transport.
-                    PollingStatusChanged?.Invoke(
-                        result.Status);
+                    // Ошибка обмена не завершает polling.
+                    // Следующий цикл повторно обратится к Transport.
+                    PollingStatusChanged?.Invoke(result.Status);
                 }
+            }
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                // Штатное завершение polling.
+                break;
+            }
+            catch (Exception ex)
+            {
+                // TODO: Подключить централизованное логирование.
+                // Неожиданная ошибка должна быть диагностирована,
+                // но не должна завершать постоянный polling.
 
+                System.Diagnostics.Trace.TraceError(
+                    $"Modbus polling failed: {ex}");
+
+                try
+                {
+                    PollingStatusChanged?.Invoke(
+                        ModbusTransportStatus.Faulted);
+                }
+                catch (Exception notificationEx)
+                {
+                    // TODO: Подключить централизованное логирование.
+                    // Ошибка подписчика не должна завершать polling.
+
+                    System.Diagnostics.Trace.TraceError(
+                        $"Modbus polling notification failed: {notificationEx}");
+                }
+            }
+
+            try
+            {
+                // Интервал отсчитывается после завершения запроса.
+                // Новые polling-запросы не накапливаются.
                 await Task.Delay(
                     _config.PollIntervalMs,
                     cancellationToken);
             }
-        }
-        catch (OperationCanceledException)
-            when (cancellationToken.IsCancellationRequested)
-        {
-            // Штатное завершение polling lifecycle.
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
         }
     }
+
 
     /// <summary>
     /// Асинхронно останавливает создание новых polling-запросов.

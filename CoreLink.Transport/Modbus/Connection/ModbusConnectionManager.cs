@@ -56,6 +56,14 @@ internal sealed class ModbusConnectionManager : IDisposable
     /// </summary>
     private IModbusMaster? _master;
 
+    /// <summary>
+    /// Признак завершения жизненного цикла ModbusConnectionManager.
+    /// Обеспечивает однократное освобождение ресурсов
+    /// при повторных или конкурентных вызовах Dispose().
+    /// 0 — активен, 1 — освобождение инициировано.
+    /// </summary>
+    private int _disposed;
+
     // FIXME: временная диагностика перенесена из Nitrogen.
     // После стабилизации CoreLink.Transport определить постоянный
     // диагностический контракт и удалить временные счётчики.
@@ -520,17 +528,23 @@ internal sealed class ModbusConnectionManager : IDisposable
         return status;
     }
 
+
     /// <summary>
-    /// Выполняет Modbus-запрос и контролирует его максимальную
-    /// продолжительность через RequestTimeoutMs.
+    /// Выполняет Modbus-запрос с независимым ограничением
+    /// времени выполнения через RequestTimeoutMs.
     ///
-    /// NModbus не поддерживает CancellationToken для уже выполняющегося
-    /// запроса. При timeout текущая TCP-сессия уничтожается, после чего
-    /// метод дожидается физического завершения старого NModbus Task.
+    /// При превышении таймаута текущая TCP-сессия закрывается.
+    /// Старому NModbus Task предоставляется ограниченное время
+    /// для завершения после освобождения сетевых ресурсов.
     ///
-    /// Исключения TcpClient/NModbus не выходят из метода:
-    /// они преобразуются в детерминированный transport status.
+    /// Если Task не завершился, ожидание прекращается.
+    /// Его поздний результат игнорируется, а исключение наблюдается
+    /// без воздействия на новую транспортную сессию.
+    ///
+    /// Метод не гарантирует физического завершения зависшего Task.
+    /// Сетевые ошибки возвращаются через ModbusTransportStatus.
     /// </summary>
+
     private async Task<(ModbusTransportStatus Status, TResult? Result)>
         ExecuteRequestWithDiagnosticsAsync<TResult>(
             Func<Task<TResult>> request)
@@ -576,6 +590,7 @@ internal sealed class ModbusConnectionManager : IDisposable
                     requestTask,
                     timeoutTask);
 
+
             if (completedTask != requestTask)
             {
                 stopwatch.Stop();
@@ -586,22 +601,63 @@ internal sealed class ModbusConnectionManager : IDisposable
                 HungRequestCount++;
                 RequestIsHung = true;
 
-                // Закрытие сокета является механизмом физического
-                // прерывания зависшего NModbus-запроса.
+                // Повреждённая TCP-сессия больше не используется.
+                // Следующий запрос создаст новый TcpClient и IModbusMaster
+                // через существующий механизм reconnect.
+                //
+                // Старый NModbus Task использует захваченный ранее master
+                // и не получает ссылку на новую сессию.
                 CloseConnection();
 
-                // Request lock остаётся захваченным до полного
-                // завершения старого Task, поэтому новая TCP-сессия
-                // не сможет использоваться одновременно со старой.
-                await ((Task)requestTask).ConfigureAwait(
-                    ConfigureAwaitOptions.SuppressThrowing);
+                // После закрытия сокета даём NModbus короткое время
+                // на физическое завершение текущей операции.
+                //
+                // FIXME: Временное диагностическое ожидание 250 мс.
+                // Уточнить по результатам испытаний зависших запросов.
+                const int shutdownGraceMs = 250;
 
-                RecoveredRequestCount++;
+                Task shutdownTask = await Task.WhenAny(
+                    requestTask,
+                    Task.Delay(shutdownGraceMs));
+
+                if (shutdownTask == requestTask)
+                {
+                    // Наблюдаем возможное исключение старого Task.
+                    // Оно не должно пробрасываться выше Transport.
+                    await ((Task)requestTask).ConfigureAwait(
+                        ConfigureAwaitOptions.SuppressThrowing);
+
+                    RecoveredRequestCount++;
+                }
+                else
+                {
+                    // NModbus Task не завершился после закрытия TCP.
+                    // Не блокируем requestLock и последующий reconnect.
+                    //
+                    // Поздний результат не публикуется и не влияет
+                    // на состояние новой транспортной сессии.
+                    //
+                    // Continuation наблюдает исключение без создания
+                    // отдельного фонового потока через Task.Run.
+                    _ = requestTask.ContinueWith(
+                        static task =>
+                        {
+                            // TODO: Подключить централизованное
+                            // логирование поздней ошибки NModbus.
+
+                            _ = task.Exception;
+                        },
+                        CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted |
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
 
                 return (
                     ModbusTransportStatus.RequestTimeout,
                     default);
             }
+
 
             try
             {
@@ -678,9 +734,13 @@ internal sealed class ModbusConnectionManager : IDisposable
         }
         finally
         {
-            // Учитываем все завершения, не только успешные ответы.
-            // При незавершённом физическом Task (HANG) сюда не попадём:
-            // сначала нужно дождаться его остановки после CloseConnection.
+            // FIXME: Временная диагностика.
+            // RequestCompletedCount учитывает завершение
+            // управляющей операции, а не обязательно физическое
+            // завершение старого NModbus Task.
+            //
+            // Удалить временные счётчики после испытаний
+            // механизма timeout/reconnect.
             RequestCompletedCount++;
             RequestInProgress = false;
             RequestIsHung = false;
@@ -728,8 +788,11 @@ internal sealed class ModbusConnectionManager : IDisposable
         }
         catch (Exception)
         {
-            // Cleanup не должен ломать детерминированное
-            // состояние Transport.
+            // TODO: Подключить централизованное логирование
+            // ошибки освобождения ресурса.
+
+            // Cleanup не должен нарушать
+            // детерминированное состояние Transport.
         }
 
         try
@@ -738,19 +801,30 @@ internal sealed class ModbusConnectionManager : IDisposable
         }
         catch (Exception)
         {
-            // Cleanup не должен ломать детерминированное
-            // состояние Transport.
+            // TODO: Подключить централизованное логирование
+            // ошибки освобождения ресурса.
+
+            // Cleanup не должен нарушать
+            // детерминированное состояние Transport.
         }
     }
 
+
     /// <summary>
-    /// Освобождает сетевые ресурсы и примитивы синхронизации.
+    /// Однократно освобождает ресурсы Modbus TCP-сессии.
+    ///
+    /// Вызывается владельцем только после завершения
+    /// всех операций Dispatcher.
     /// </summary>
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         CloseConnection();
 
         _connectionLock.Dispose();
         _requestLock.Dispose();
     }
+
 }

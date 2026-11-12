@@ -331,10 +331,15 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
         return false;
     }
 
+
     /// <summary>
     /// Выполняет одну команду записи через ModbusConnectionManager.
     ///
-    /// Результат manager передаётся без преобразования в исключение.
+    /// Штатные результаты Transport передаются без изменений.
+    /// Неожиданное исключение преобразуется в Faulted, чтобы
+    /// не завершать единственный worker диспетчера.
+    ///
+    /// Completion завершается при любом обработанном результате.
     /// </summary>
     private async Task ExecuteWriteAsync(
         WriteRequest request,
@@ -342,73 +347,123 @@ internal sealed class ModbusRequestDispatcher : IAsyncDisposable
     {
         ModbusWriteResult result;
 
-        if (cancellationToken.IsCancellationRequested)
+        try
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                result = CreateCancelledWriteResult();
+            }
+            else if (request.Values is null)
+            {
+                result =
+                    await _connectionManager.WriteSingleRegisterAsync(
+                        request.SlaveId,
+                        request.Address,
+                        request.Value,
+                        cancellationToken);
+            }
+            else
+            {
+                result =
+                    await _connectionManager.WriteMultipleRegistersAsync(
+                        request.SlaveId,
+                        request.Address,
+                        request.Values,
+                        cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            // Штатная отмена операции владельцем lifecycle.
             result = CreateCancelledWriteResult();
         }
-        else if (request.Values is null)
+        catch (Exception ex)
         {
-            result =
-                await _connectionManager.WriteSingleRegisterAsync(
-                    request.SlaveId,
-                    request.Address,
-                    request.Value,
-                    cancellationToken);
-        }
-        else
-        {
-            result =
-                await _connectionManager.WriteMultipleRegistersAsync(
-                    request.SlaveId,
-                    request.Address,
-                    request.Values,
-                    cancellationToken);
+            // TODO: Подключить централизованное логирование.
+            // Неожиданное исключение не должно завершать worker.
+
+            System.Diagnostics.Trace.TraceError(
+                $"Modbus dispatcher write failed: {ex}");
+
+            result = new ModbusWriteResult
+            {
+                Status = ModbusTransportStatus.Faulted
+            };
         }
 
-        request.Completion.TrySetResult(
-            result);
+        // Завершаем ожидающий Task без проброса исключений.
+        request.Completion.TrySetResult(result);
     }
+
+
 
     /// <summary>
     /// Выполняет одну операцию чтения через ModbusConnectionManager.
     ///
-    /// Пустой массив не используется как признак отказа:
-    /// status и Data передаются вызывающей стороне как единый результат.
+    /// Результат содержит статус и данные одной операции.
+    /// При неожиданной ошибке возвращается Faulted без данных.
+    ///
+    /// Ошибка одного запроса не завершает dispatcher worker.
     /// </summary>
-
     private async Task ExecuteReadAsync(
         ReadRequest request,
         CancellationToken cancellationToken)
     {
         ModbusReadResult result;
 
-        if (cancellationToken.IsCancellationRequested)
+        try
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                result = CreateCancelledReadResult();
+            }
+            else
+            {
+                result = request.FunctionCode switch
+                {
+                    3 => await _connectionManager.ReadHoldingRegistersAsync(
+                        request.SlaveId,
+                        request.StartAddress,
+                        request.Count,
+                        cancellationToken),
+
+                    4 => await _connectionManager.ReadInputRegistersAsync(
+                        request.SlaveId,
+                        request.StartAddress,
+                        request.Count,
+                        cancellationToken),
+
+                    _ => throw new InvalidOperationException(
+                        "Unsupported Modbus read function code.")
+                };
+            }
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            // Штатная отмена при остановке Dispatcher.
             result = CreateCancelledReadResult();
         }
-        else
+        catch (Exception ex)
         {
-            result = request.FunctionCode switch
+            // TODO: Подключить централизованное логирование.
+            // Неожиданная ошибка не должна завершать worker.
+
+            System.Diagnostics.Trace.TraceError(
+                $"Modbus dispatcher read failed: {ex}");
+
+            result = new ModbusReadResult
             {
-                3 => await _connectionManager.ReadHoldingRegistersAsync(
-                    request.SlaveId,
-                    request.StartAddress,
-                    request.Count,
-                    cancellationToken),
-
-                4 => await _connectionManager.ReadInputRegistersAsync(
-                    request.SlaveId,
-                    request.StartAddress,
-                    request.Count,
-                    cancellationToken),
-
-                _ => throw new InvalidOperationException(
-                    "Unsupported Modbus read function code.")
+                Status = ModbusTransportStatus.Faulted,
+                Data = null
             };
         }
 
+        // Любой обработанный запрос получает конечный результат.
         request.Completion.TrySetResult(result);
     }
+
 
 
     /// <summary>
