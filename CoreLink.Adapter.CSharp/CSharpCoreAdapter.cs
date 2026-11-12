@@ -122,4 +122,94 @@ public sealed  class CSharpCoreAdapter : ICore
         }
     }
 
+
+    /// <summary>
+    /// Передаёт одиночную запись Word в Core.
+    /// Ошибки не пересекают границу адаптера.
+    /// </summary>
+    public async Task<CoreWriteStatus> WriteWordAsync(
+        ushort address,
+        ushort value)
+    {
+        try
+        {
+            return await _core.WriteWordAsync(
+                address,
+                value)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить логирование ошибок
+            // адаптера при одиночной записи Word.
+            ReportWriteError(ex);
+            return CoreWriteStatus.Failed;
+        }
+    }
+
+    /// <summary>
+    /// Передаёт запись Float32 в Core.
+    /// Не выполняет кодирование Modbus самостоятельно.
+    /// </summary>
+    public async Task<CoreWriteStatus> WriteFloatAsync(
+        ushort address,
+        float value)
+    {
+        try
+        {
+            return await _core.WriteFloatAsync(
+                address,
+                value)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить логирование ошибок
+            // адаптера при одиночной записи Float32.
+            ReportWriteError(ex);
+            return CoreWriteStatus.Failed;
+        }
+    }
+
+    /// <summary>
+    /// Передаёт одноразовый Batch-дескриптор Core.
+    /// Не управляет временем жизни входного массива.
+    /// </summary>
+    public async Task<CoreWriteStatus> WriteBatchAsync(
+        ReadOnlyMemory<byte> descriptor)
+    {
+        try
+        {
+            return await _core.WriteBatchAsync(descriptor)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить логирование ошибок
+            // адаптера при Batch Write.
+            ReportWriteError(ex);
+            return CoreWriteStatus.Failed;
+        }
+    }
+
+    /// <summary>
+    /// Временный вывод диагностической информации Write.
+    /// </summary>
+    private static void ReportWriteError(Exception exception)
+    {
+        // TODO: Заменить Trace централизованным
+        // логированием CoreLink.
+        try
+        {
+            Trace.TraceError(
+                $"CoreLink adapter Write failed: {exception}");
+        }
+        catch (Exception)
+        {
+            // Ошибки диагностики не должны
+            // нарушать выполнение адаптера.
+        }
+    }
+
+
 }

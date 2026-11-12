@@ -83,6 +83,41 @@ public unsafe interface ICore
     /// Уведомляет об изменении состояния Core.
     /// </summary>
     event Action<CoreStatus>? StatusChanged;
+
+
+    /// <summary>
+    /// Записывает один Word через FC06.
+    ///
+    /// Адрес логический, не ValueId.
+    /// Не изменяет snapshot и Rx.
+    /// </summary>
+    Task<CoreWriteStatus> WriteWordAsync(
+        ushort address,
+        ushort value);
+
+    /// <summary>
+    /// Записывает Float32 через FC16.
+    ///
+    /// Занимает два последовательных регистра.
+    /// RegisterOrder берётся из текущей сессии.
+    /// </summary>
+    Task<CoreWriteStatus> WriteFloatAsync(
+        ushort address,
+        float value);
+
+    /// <summary>
+    /// Записывает непрерывный диапазон через FC16.
+    ///
+    /// Дескриптор создан Client.
+    /// Максимум 123 физических регистра.
+    /// Весь запрос проверяется до отправки.
+    ///
+    /// Результат возвращается статусом.
+    /// Повторная запись не выполняется.
+    /// </summary>
+    Task<CoreWriteStatus> WriteBatchAsync(
+        ReadOnlyMemory<byte> descriptor);
+
 }
 
 

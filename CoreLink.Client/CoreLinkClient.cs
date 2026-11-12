@@ -7,6 +7,7 @@ using CoreLink.Contracts.Core;
 using CoreLink.Contracts.Maps;
 using CoreLink.Rx.Runtime;
 using CoreLink.Contracts.Registers;
+using System.Buffers.Binary;
 
 namespace CoreLink.Client;
 
@@ -597,6 +598,206 @@ public sealed class CoreLinkClient
         Volatile.Write(
             ref _lastSingleReadStatus,
             (int)status);
+    }
+
+
+    // Последний результат пользовательской операции Write.
+    // Не является состоянием TCP-соединения или polling.
+    private int _lastWriteStatus =
+        (int)CoreWriteStatus.Stopped;
+
+    /// <summary>
+    /// Последний статус операции записи.
+    ///
+    /// Потребитель запрашивает его при необходимости.
+    /// </summary>
+    public CoreWriteStatus LastWriteStatus =>
+        (CoreWriteStatus)Volatile.Read(
+            ref _lastWriteStatus);
+
+    /// <summary>
+    /// Обновляет диагностический статус записи.
+    /// </summary>
+    private void SetWriteStatus(CoreWriteStatus status)
+    {
+        Volatile.Write(
+            ref _lastWriteStatus,
+            (int)status);
+    }
+
+    /// <summary>
+    /// Записывает один Word через FC06.
+    ///
+    /// Не изменяет snapshot.
+    /// Не выполняет повторную запись.
+    /// </summary>
+    public Task WriteWordAsync(
+        ushort address,
+        ushort value)
+    {
+        return ExecuteClientWriteAsync(
+            () => _core.WriteWordAsync(address, value));
+    }
+
+    /// <summary>
+    /// Записывает Float32 через FC16.
+    ///
+    /// RegisterOrder берётся из текущей сессии.
+    /// Не выполняет контрольное чтение.
+    /// </summary>
+    public Task WriteFloatAsync(
+        ushort address,
+        float value)
+    {
+        return ExecuteClientWriteAsync(
+            () => _core.WriteFloatAsync(address, value));
+    }
+
+    /// <summary>
+    /// Записывает последовательность Word/Float32.
+    ///
+    /// Потребитель передаёт типизированные значения.
+    /// Client создаёт одноразовый бинарный дескриптор.
+    ///
+    /// Один Batch соответствует одному FC16.
+    /// Максимум 123 физических регистра.
+    /// </summary>
+    public async Task WriteBatchAsync(
+        ushort startAddress,
+        IReadOnlyList<CoreWriteValue> values)
+    {
+        if (values is null || values.Count == 0 ||
+            values.Count > 123)
+        {
+            SetWriteStatus(CoreWriteStatus.BadConfig);
+            return;
+        }
+
+        try
+        {
+            int registerCount = 0;
+
+            // Полностью проверяем запрос до создания
+            // дескриптора и передачи данных в Core.
+            foreach (CoreWriteValue value in values)
+            {
+                int length = value.Type switch
+                {
+                    RegisterType.Word => 1,
+                    RegisterType.Float => 2,
+                    _ => 0
+                };
+
+                if (length == 0)
+                {
+                    SetWriteStatus(CoreWriteStatus.BadConfig);
+                    return;
+                }
+
+                registerCount += length;
+
+                if (registerCount > 123)
+                {
+                    SetWriteStatus(CoreWriteStatus.BadConfig);
+                    return;
+                }
+            }
+
+            if ((uint)startAddress +
+                (uint)registerCount > 65536u)
+            {
+                SetWriteStatus(CoreWriteStatus.BadConfig);
+                return;
+            }
+
+            // Временный дескриптор принадлежит Client.
+            // Он сохраняется до завершения операции Core.
+            byte[] descriptor =
+                new byte[4 + values.Count * 5];
+
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                descriptor.AsSpan(0, 2),
+                startAddress);
+
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                descriptor.AsSpan(2, 2),
+                (ushort)values.Count);
+
+            for (int i = 0; i < values.Count; i++)
+            {
+                CoreWriteValue value = values[i];
+                int offset = 4 + i * 5;
+
+                descriptor[offset] = (byte)value.Type;
+
+                if (value.Type == RegisterType.Word)
+                {
+                    BinaryPrimitives.WriteUInt16LittleEndian(
+                        descriptor.AsSpan(offset + 1, 2),
+                        value.WordValue);
+                }
+                else
+                {
+                    uint bits =
+                        BitConverter.SingleToUInt32Bits(
+                            value.FloatValue);
+
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        descriptor.AsSpan(offset + 1, 4),
+                        bits);
+                }
+            }
+
+            await ExecuteClientWriteAsync(
+                () => _core.WriteBatchAsync(descriptor))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить централизованное
+            // логирование формирования Batch-дескриптора.
+            ReportError("Batch Write failed.", ex);
+
+            SetWriteStatus(CoreWriteStatus.Failed);
+        }
+    }
+
+    /// <summary>
+    /// Выполняет пользовательскую операцию записи.
+    ///
+    /// Проверяет lifecycle Client.
+    /// Получает статус Core и сохраняет его
+    /// для отдельной диагностики.
+    ///
+    /// Исключения не передаются ViewModel.
+    /// </summary>
+    private async Task ExecuteClientWriteAsync(
+        Func<Task<CoreWriteStatus>> operation)
+    {
+        lock (_lifecycleLock)
+        {
+            if (_state != CoreLinkState.Running)
+            {
+                SetWriteStatus(CoreWriteStatus.Stopped);
+                return;
+            }
+        }
+
+        try
+        {
+            CoreWriteStatus status =
+                await operation().ConfigureAwait(false);
+
+            SetWriteStatus(status);
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить централизованное
+            // логирование ошибок Write в Client.
+            ReportError("Client Write failed.", ex);
+
+            SetWriteStatus(CoreWriteStatus.Failed);
+        }
     }
 
 }

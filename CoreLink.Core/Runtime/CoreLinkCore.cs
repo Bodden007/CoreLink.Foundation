@@ -9,6 +9,7 @@ using CoreLink.Core.Configuration.Models;
 using CoreLink.Transport.Modbus;
 using CoreLink.Transport.Modbus.Results;
 using NModbus.Utility;
+using System.Buffers.Binary;
 
 namespace CoreLink.Core.Runtime;
 
@@ -991,6 +992,332 @@ public sealed class CoreLinkCore
             return new CoreSingleReadResult(
                 CoreReadStatus.Failed,
                 default);
+        }
+    }
+
+
+    /// <summary>
+    /// Записывает один Word через FC06.
+    ///
+    /// Использует существующую сессию Transport.
+    /// Не выполняет повторную отправку команды.
+    /// </summary>
+    public Task<CoreWriteStatus> WriteWordAsync(
+        ushort address,
+        ushort value)
+    {
+        return ExecuteWriteAsync(
+            session => session.WriteSingleRegisterAsync(
+                address,
+                value));
+    }
+
+
+    /// <summary>
+    /// Записывает Float32 через FC16.
+    ///
+    /// Порядок регистров определяется общей
+    /// конфигурацией текущей сессии.
+    ///
+    /// Два регистра отправляются одной командой.
+    /// </summary>
+    public async Task<CoreWriteStatus> WriteFloatAsync(
+        ushort address,
+        float value)
+    {
+        if ((uint)address + 2u > 65536u)
+            return CoreWriteStatus.BadConfig;
+
+        RegisterOrder order;
+
+        lock (_snapshotLock)
+        {
+            if (_stopping || _map is null)
+                return CoreWriteStatus.Stopped;
+
+            order = _map.RegisterOrder;
+        }
+
+        ushort[] registers = new ushort[2];
+
+        EncodeFloat32(value, order, registers, 0);
+
+        return await ExecuteWriteAsync(
+            session => session.WriteMultipleRegistersAsync(
+                address,
+                registers))
+            .ConfigureAwait(false);
+    }
+
+
+    /// <summary>
+    /// Выполняет Batch Write через один FC16.
+    ///
+    /// Дескриптор содержит начальный адрес,
+    /// количество и типизированные значения.
+    ///
+    /// До первой сетевой операции проверяются:
+    /// - размер дескриптора;
+    /// - типы всех значений;
+    /// - число физических регистров;
+    /// - границы адресного пространства.
+    ///
+    /// Разбиение Batch на несколько запросов запрещено.
+    /// </summary>
+    public async Task<CoreWriteStatus> WriteBatchAsync(
+        ReadOnlyMemory<byte> descriptor)
+    {
+        if (descriptor.Length < 9)
+            return CoreWriteStatus.BadConfig;
+
+        ReadOnlySpan<byte> header = descriptor.Span;
+
+        ushort address =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                header.Slice(0, 2));
+
+        ushort count =
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                header.Slice(2, 2));
+
+        if (count == 0 ||
+            descriptor.Length != 4 + count * 5)
+        {
+            return CoreWriteStatus.BadConfig;
+        }
+
+        int registerCount = 0;
+
+        // Сначала проверяем весь дескриптор.
+        // Некорректный элемент не должен приводить
+        // к частичной отправке команды.
+        for (int i = 0; i < count; i++)
+        {
+            byte type = descriptor.Span[4 + i * 5];
+
+            int length = type switch
+            {
+                (byte)RegisterType.Word => 1,
+                (byte)RegisterType.Float => 2,
+                _ => 0
+            };
+
+            if (length == 0)
+                return CoreWriteStatus.BadConfig;
+
+            registerCount += length;
+
+            if (registerCount > 123)
+                return CoreWriteStatus.BadConfig;
+        }
+
+        if ((uint)address + (uint)registerCount > 65536u)
+            return CoreWriteStatus.BadConfig;
+
+        RegisterOrder order;
+
+        lock (_snapshotLock)
+        {
+            if (_stopping || _map is null)
+                return CoreWriteStatus.Stopped;
+
+            order = _map.RegisterOrder;
+        }
+
+        ushort[] registers = new ushort[registerCount];
+        int position = 0;
+
+        // Формируем собственные регистры Core.
+        // Эти данные не связаны с памятью потребителя.
+        for (int i = 0; i < count; i++)
+        {
+            int offset = 4 + i * 5;
+            ReadOnlySpan<byte> entry =
+                descriptor.Span.Slice(offset + 1, 4);
+
+            RegisterType type =
+                (RegisterType)descriptor.Span[offset];
+
+            if (type == RegisterType.Word)
+            {
+                registers[position++] =
+                    BinaryPrimitives.ReadUInt16LittleEndian(
+                        entry);
+            }
+            else
+            {
+                uint bits =
+                    BinaryPrimitives.ReadUInt32LittleEndian(
+                        entry);
+
+                float value =
+                    BitConverter.UInt32BitsToSingle(bits);
+
+                EncodeFloat32(
+                    value,
+                    order,
+                    registers,
+                    position);
+
+                position += 2;
+            }
+        }
+
+        return await ExecuteWriteAsync(
+            session => session.WriteMultipleRegistersAsync(
+                address,
+                registers))
+            .ConfigureAwait(false);
+    }
+
+
+    /// <summary>
+    /// Преобразует Float32 в два Modbus-регистра.
+    ///
+    /// Порядок соответствует действующему
+    /// TryDecodeValue в Core.
+    ///
+    /// Регистры размещаются в готовом массиве Core.
+    /// </summary>
+    private static void EncodeFloat32(
+        float value,
+        RegisterOrder order,
+        ushort[] destination,
+        int offset)
+    {
+        uint bits = BitConverter.SingleToUInt32Bits(value);
+
+        ushort lowWord = (ushort)bits;
+        ushort highWord = (ushort)(bits >> 16);
+
+        switch (order)
+        {
+            case RegisterOrder.ABCD:
+                destination[offset] = lowWord;
+                destination[offset + 1] = highWord;
+                break;
+
+            case RegisterOrder.BADC:
+                destination[offset] = SwapBytes(lowWord);
+                destination[offset + 1] = SwapBytes(highWord);
+                break;
+
+            case RegisterOrder.CDAB:
+                destination[offset] = highWord;
+                destination[offset + 1] = lowWord;
+                break;
+
+            case RegisterOrder.DCBA:
+                destination[offset] = SwapBytes(highWord);
+                destination[offset + 1] = SwapBytes(lowWord);
+                break;
+        }
+    }
+
+
+    /// <summary>
+    /// Выполняет одну операцию записи через Transport.
+    ///
+    /// Состояния Transport преобразуются
+    /// в существующую модель статусных операций.
+    ///
+    /// Повторная отправка запрещена.
+    /// Исключения не выходят за границу Core.
+    /// </summary>
+    private async Task<CoreWriteStatus> ExecuteWriteAsync(
+        Func<ModbusTransportSession,
+            Task<ModbusWriteResult>> operation)
+    {
+        ModbusTransportSession session;
+
+        lock (_snapshotLock)
+        {
+            if (_stopping || _transport is null)
+                return CoreWriteStatus.Stopped;
+
+            session = _transport;
+        }
+
+        try
+        {
+            ModbusWriteResult result =
+                await operation(session)
+                    .ConfigureAwait(false);
+
+            return MapWriteStatus(result.Status);
+        }
+        catch (ObjectDisposedException ex)
+        {
+            // TODO: Подключить логирование
+            // завершения Transport во время Write.
+            ReportWriteError(ex);
+
+            return IsStopping()
+                ? CoreWriteStatus.Stopped
+                : CoreWriteStatus.Failed;
+        }
+        catch (InvalidOperationException ex)
+        {
+            // TODO: Подключить логирование
+            // некорректного состояния сессии.
+            ReportWriteError(ex);
+
+            return IsStopping()
+                ? CoreWriteStatus.Stopped
+                : CoreWriteStatus.Failed;
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить централизованное
+            // логирование неожиданных ошибок записи.
+            ReportWriteError(ex);
+
+            return CoreWriteStatus.Failed;
+        }
+    }
+
+    /// <summary>
+    /// Преобразует статус Transport в статус Write.
+    /// Не подменяет ошибки успешным выполнением.
+    /// </summary>
+    private static CoreWriteStatus MapWriteStatus(
+        ModbusTransportStatus status)
+    {
+        return status switch
+        {
+            ModbusTransportStatus.Ok =>
+                CoreWriteStatus.Ok,
+
+            ModbusTransportStatus.Disconnected or
+            ModbusTransportStatus.ConnectTimeout =>
+                CoreWriteStatus.Disconnected,
+
+            ModbusTransportStatus.RequestTimeout =>
+                CoreWriteStatus.Timeout,
+
+            ModbusTransportStatus.Cancelled =>
+                CoreWriteStatus.Stopped,
+
+            _ => CoreWriteStatus.Failed
+        };
+    }
+
+    /// <summary>
+    /// Временная диагностика ошибок записи.
+    /// </summary>
+    private static void ReportWriteError(Exception exception)
+    {
+        // TODO: Заменить Trace на централизованный
+        // промышленный механизм логирования CoreLink.
+        try
+        {
+            Trace.TraceError(
+                $"CoreLink Write failed: {exception}");
+        }
+        catch (Exception)
+        {
+            // Ошибка диагностического вывода
+            // не должна нарушать контракт Core.
         }
     }
 
