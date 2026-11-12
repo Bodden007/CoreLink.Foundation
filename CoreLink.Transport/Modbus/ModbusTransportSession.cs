@@ -16,6 +16,19 @@ namespace CoreLink.Transport.Modbus;
 /// </summary>
 public sealed class ModbusTransportSession : IAsyncDisposable
 {
+    /// <summary>
+    /// Защищает запуск процедуры освобождения ресурсов
+    /// от одновременных вызовов DisposeAsync().
+    /// </summary>
+    private readonly object _disposeLock = new();
+
+    /// <summary>
+    /// Общая задача освобождения ресурсов сессии.
+    /// Повторные вызовы DisposeAsync() ожидают ту же операцию,
+    /// не создавая дополнительных процедур остановки.
+    /// </summary>
+
+    private Task? _disposeTask;
     private readonly ModbusConnectionManager _connectionManager;
     private readonly ModbusRequestDispatcher _dispatcher;
     private readonly ModbusPoller _poller;
@@ -200,38 +213,78 @@ public sealed class ModbusTransportSession : IAsyncDisposable
             $"  DispatcherRunning    = {_dispatcher.IsRunning}");
     }
 
+
     /// <summary>
-    /// Завершает Transport и измеряет время остановки.
+    /// Асинхронно освобождает ресурсы Modbus TCP-сессии.
+    ///
+    /// Конкурентные вызовы используют одну задачу завершения.
+    /// Повторный вызов не запускает освобождение повторно.
     /// </summary>
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (_disposed)
-            return;
+        lock (_disposeLock)
+        {
+            _disposeTask ??= DisposeCoreAsync();
 
-        // FIXME: временная диагностика.
-        Stopwatch stopwatch = Stopwatch.StartNew();
-
-        PrintStopDiagnostics("STOP BEGIN");
-
-        _poller.RegistersReceived -= OnRegistersReceived;
-        _poller.PollingStatusChanged -= OnPollingStatusChanged;
-
-        await _poller.DisposeAsync();
-
-        PrintStopDiagnostics("POLLER STOPPED");
-
-        await _dispatcher.DisposeAsync();
-
-        PrintStopDiagnostics("DISPATCHER STOPPED");
-
-        _connectionManager.Dispose();
-
-        _disposed = true;
-
-        stopwatch.Stop();
-
-        Console.WriteLine(
-            $"[TRANSPORT STOP COMPLETE] " +
-            $"Elapsed={stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+            return new ValueTask(_disposeTask);
+        }
     }
+
+    /// <summary>
+    /// Последовательно останавливает Poller и Dispatcher,
+    /// затем освобождает TCP-сессию.
+    ///
+    /// Порядок освобождения сохраняется:
+    /// Poller -> Dispatcher -> ConnectionManager.
+    /// </summary>
+    private async Task DisposeCoreAsync()
+    {
+        try
+        {
+            // Запрещаем повторный Start сессии.
+            _disposed = true;
+
+            // FIXME: Временная диагностика остановки.
+            // Удалить после испытаний timeout/reconnect.
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            PrintStopDiagnostics("STOP BEGIN");
+
+            _poller.RegistersReceived -= OnRegistersReceived;
+            _poller.PollingStatusChanged -= OnPollingStatusChanged;
+
+            await _poller.DisposeAsync()
+                .ConfigureAwait(false);
+
+            PrintStopDiagnostics("POLLER STOPPED");
+
+            await _dispatcher.DisposeAsync()
+                .ConfigureAwait(false);
+
+            PrintStopDiagnostics("DISPATCHER STOPPED");
+
+            _connectionManager.Dispose();
+
+            stopwatch.Stop();
+
+            // FIXME: Временная диагностика длительности Stop.
+            // Удалить после испытаний освобождения ресурсов.
+            Console.WriteLine(
+                $"[TRANSPORT STOP COMPLETE] " +
+                $"Elapsed={stopwatch.Elapsed.TotalMilliseconds:F1} ms");
+        }
+        catch (Exception ex)
+        {
+            // TODO: Подключить централизованное логирование.
+            // Ошибка освобождения не пробрасывается наружу.
+            //
+            // При незавершённой остановке worker запрещено
+            // принудительно уничтожать ConnectionManager:
+            // это может вызвать обращение к освобождённым ресурсам.
+
+            Trace.TraceError(
+                $"Modbus transport dispose failed: {ex}");
+        }
+    }
+
 }
