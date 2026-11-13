@@ -5,6 +5,20 @@
 
 ## 1. Назначение и технологическая основа
 
+## Актуальный контракт выбора реализации ядра (13.11.2026)
+
+**Инвариант:** `CoreLink.Client` зависит от `ICore`, а не от конкретной реализации ядра. `ICore` определён в `CoreLink.Contracts`. Конкретный адаптер выбирается на внешней точке композиции приложения и передаётся в конструктор `CoreLinkClient(ICore core)`. Это намеренное архитектурное решение, а не утечка внутренней реализации.
+
+- Сегодня реализация `ICore` — `CoreLink.Adapter.CSharp.CSharpCoreAdapter`, который использует `CoreLink.Core` и `CoreLink.Transport`.
+- Будущая реализация на Rust может быть подключена через другой адаптер `ICore` с сохранением публичного API Client, **если** выполняет тот же контракт. Rust/FFI-адаптер пока не считается реализованным.
+- `CoreLink.Client` не должен создавать `CSharpCoreAdapter` самостоятельно, добавлять к нему прямую зависимость или определять платформенную реализацию ядра. Не скрывать выбор реализации внутри Client.
+- Приложение работает с технологическими данными через `CoreLink.Client` и `CoreLink.Contracts`; точка композиции приложения дополнительно знает выбранный адаптер только для его создания. Это не означает, что ViewModel или UI должны вызывать методы адаптера.
+- При поставке готовых DLL необходимы все транзитивные managed-зависимости выбранной реализации. Наличие `Adapter.CSharp.dll` в комплекте поставки не делает методы адаптера публичным прикладным API.
+- Контракты и карты доступны извне: приложение составляет `CoreLinkMap` и вызывает `Start(CoreLinkMap)`. `ValueId` определяется позицией в карте, не адресом Modbus.
+- Текущие методы записи: `WriteWordAsync`, `WriteFloatAsync`, `WriteBatchAsync`; интеграционное тестирование и промышленное подтверждение этих путей следует оценивать отдельно от наличия методов.
+- Отдельная сборка managed DLL не тождественна NativeAOT-публикации приложения или созданию native-библиотеки Rust.
+
+
 CoreLink.Foundation — инфраструктура обмена данными PLC для .NET 10. Текущий транспорт: Modbus TCP, NModbus 3.0.83. Область применения — приложения, которым нужны регулярная телеметрия, адресное чтение параметров, управляемое состояние связи и Rx-публикация изменений.
 
 Основные инженерные приоритеты: надёжность, детерминированные статусы, слабая связанность, тестируемость, минимальная дополнительная инфраструктура. NativeAOT — целевое ограничение, **не** подтверждённый полный publish решения.
@@ -47,7 +61,7 @@ Modbus TCP → PLC
 
 `ICore`: `Start(CoreMap)`, `Stop()`, `GetSnapshot(float*, int)`, `ReadAsync(IReadOnlyList<int>)`, событие `StatusChanged`.
 
-`CoreLinkClient`: `Start(string mapId)`, `GetSnapshot(out ReadOnlyMemory<float>)`, `ReadAsync(IReadOnlyList<int>)`, `StopAsync()`, `Stop()`, свойства `State`, `CoreMap`, `Values`, `Statuses`, метод `ObserveValue(int valueId)`.
+`CoreLinkClient`: `Start(CoreLinkMap map)`, `GetSnapshot(out ReadOnlyMemory<float>)`, `ReadAsync(IReadOnlyList<int>)`, `StopAsync()`, `Stop()`, свойства `State`, `CoreMap`, `Values`, `Statuses`, метод `ObserveValue(int valueId)`.
 
 `CoreStatus`, `CoreLinkState`, `SnapshotStatus` решают разные задачи. Возвращаемый snapshot — **копия в повторно используемый буфер Client**, а не долговременный immutable-array. Повторный Start после Stopped на том же Client не предусмотрен. Rx завершается прежде Core; пользовательский обработчик Rx не должен синхронно блокировать Stop.
 
@@ -67,7 +81,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 
 ### 3.3 Запись — открытая задача
 
-Во внутренней `ModbusTransportSession` доступны `WriteSingleRegisterAsync` (FC06) и `WriteMultipleRegistersAsync` (FC16), и Dispatcher имеет очередь записи. **Публичного Write API через ICore/Client на момент документации нет**.
+Во внутренней `ModbusTransportSession` доступны `WriteSingleRegisterAsync` (FC06) и `WriteMultipleRegistersAsync` (FC16), и Dispatcher имеет очередь записи. **Историческая фиксация (11.11.2026): публичного Write API через ICore/Client на момент документации нет**.
 
 Требуемый будущий путь: `Client → ICore → Core → Transport → Dispatcher`; единый transport/lifecycle и статусы, проверка адресов/типов и данных до постановки запроса в очередь. Диагностический FC03/FC06/FC16 в TestHost использует **отдельный TCP-клиент**; его успех не подтверждает арбитраж Write в CoreLink.
 
@@ -121,7 +135,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 ## 8. Открытые критерии приёмки
 
 1. Проверить, что локально испытанные исходники перенесены в актуальную ветку GitHub; иначе документация продолжает различать две версии.
-2. Реализовать публичный Write API с явными статусами, валидацией и единым Dispatcher, если утверждён соответствующий контракт.
+2. Публичные методы записи `WriteWordAsync`, `WriteFloatAsync`, `WriteBatchAsync` добавлены; отдельно подтвердить корректность маршрута через единый Dispatcher, статусы, валидацию и поведение при отказах.
 3. Повторить concurrency stress через **один CoreLink Transport**: polling + Read + Write, проверить приоритет, отсутствие starvation, подтверждение данных через FC03.
 4. Проверить Stop при разных точках зависшего I/O, при необслуженных очередях и при одновременных вызовах.
 5. Проверить все поддерживаемые порядки Word/Byte и ошибки Modbus Exception.
