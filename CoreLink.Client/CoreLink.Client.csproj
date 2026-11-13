@@ -12,4 +12,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+    <ItemGroup>
+    <ProjectReference Include="..\CoreLink.Contracts\CoreLink.Contracts.csproj" />
+    <ProjectReference Include="..\CoreLink.Maps\CoreLink.Maps.csproj" />
+    <ProjectReference Include="..\CoreLink.Rx\CoreLink.Rx.csproj" />
+  </ItemGroup>
+
 </Project>

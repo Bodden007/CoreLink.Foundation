@@ -1,74 +1,41 @@
 
 using CoreLink.Contracts.Maps;
 using CoreLink.Maps.Configuration;
-using CoreLink.Maps.Maps;
 
 namespace CoreLink.Maps;
 
 /// <summary>
-/// Предоставляет Core и Rx проекции одной карты.
+/// Преобразует публичную карту конфигурации
+/// в представления Core и Rx.
 ///
-/// Core получает бинарную карту v2.
-/// Rx получает managed-описания значений
-/// и зарегистрированных систем единиц.
+/// Не управляет lifecycle, транспортом и polling.
 /// </summary>
-public sealed class MapProvider : IMapProvider
+public static class MapProvider
 {
-    public bool TryLoad(
-        string mapId,
-        out CoreMap? coreMap)
+    /// <summary>
+    /// Формирует бинарную карту Core.
+    ///
+    /// Ошибки преобразования обрабатываются
+    /// вызывающим CoreLink.Client.
+    /// </summary>
+    public static CoreMap BuildCore(CoreLinkMap map)
     {
-        coreMap = null;
-
-        var registers = RegisterMap.Registers;
-
-        if (registers.Length == 0)
-            return false;
-
-        var map = new CoreLinkMap
-        {
-            IpAddress = ConnectionMap.IpAddress,
-            Port = ConnectionMap.Port,
-            UnitId = ConnectionMap.UnitId,
-
-            PollFunctionCode = ConnectionMap.PollFunctionCode,
-            PollIntervalMs = ConnectionMap.PollIntervalMs,
-
-            ConnectTimeoutMs = ConnectionMap.ConnectTimeoutMs,
-            RequestTimeoutMs = ConnectionMap.RequestTimeoutMs,
-            ReconnectDelayMs = ConnectionMap.ReconnectDelayMs,
-
-            RegisterOrder = ConnectionMap.Order,
-            Registers = registers
-        };
-
-        try
-        {
-            coreMap = CoreMapEncoder.Encode(map);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Trace.TraceError(
-                $"Core map encoding failed: {ex}");
-
-            return false;
-        }
+        return CoreMapEncoder.Encode(map);
     }
 
     /// <summary>
-    /// Формирует Rx-карту.
-    /// ValueId соответствует индексу RegisterMap.
+    /// Формирует managed-карту Rx.
+    /// Порядок регистров определяет ValueId.
     /// </summary>
-    public bool TryLoadRxMap(
-        string mapId,
+    public static bool TryBuildRx(
+        CoreLinkMap map,
         out RxMapConfiguration? rxMap,
         out string? error)
     {
         return RxMapBuilder.TryBuild(
-            RegisterMap.Registers,
-            RegisterMap.SupportedUnitSystemIds,
-            ConnectionMap.RxIntervalMs,
+            map.Registers,
+            map.SupportedUnitSystemIds,
+            map.RxIntervalMs,
             out rxMap,
             out error);
     }

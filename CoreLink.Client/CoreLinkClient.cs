@@ -1,3 +1,7 @@
+
+using System.Net;
+using System.Net.Sockets;
+using CoreLink.Maps;
 using System.Diagnostics;
 using CoreLink.Client.Configuration;
 using CoreLink.Client.Lifecycle;
@@ -22,7 +26,24 @@ namespace CoreLink.Client;
 /// </summary>
 public sealed class CoreLinkClient
 {
-    private readonly IMapProvider _mapProvider;
+
+    private readonly ICore _core;
+
+    private string? _lastError;
+
+    public string? LastError
+    {
+        get
+        {
+            lock (_lifecycleLock)
+                return _lastError;
+        }
+    }
+
+    public CoreLinkClient(ICore core)
+    {
+        _core = core;
+    }
     private readonly ICore _core;
 
     private readonly object _lifecycleLock = new();
@@ -97,7 +118,8 @@ public sealed class CoreLinkClient
     /// Повторный Start после Stop не поддерживается
     /// существующим контрактом экземпляра ICore.
     /// </summary>
-    public CoreLinkResult Start(string mapId)
+
+    public CoreLinkResult Start(CoreLinkMap? map)
     {
         lock (_lifecycleLock)
         {
@@ -108,34 +130,47 @@ public sealed class CoreLinkClient
                 return CoreLinkResult.SessionError;
 
             _state = CoreLinkState.Starting;
+            _lastError = null;
 
             try
             {
-                if (_mapProvider is null ||
-                    _core is null ||
-                    string.IsNullOrWhiteSpace(mapId))
+                if (!TryValidateMap(map, out string? error))
+                    return StartFailed(
+                        CoreLinkResult.BadConfig,
+                        error ?? "Invalid CoreLink map.");
+
+                if (_core is null)
+                    return StartFailed(
+                        CoreLinkResult.SessionError,
+                        "Core implementation is null.");
+
+                CoreMap coreMap;
+
+                try
                 {
-                    return StartFailed(CoreLinkResult.BadConfig);
+                    coreMap = MapProvider.BuildCore(map!);
+                }
+                catch (Exception ex) when (
+                    ex is ArgumentException or
+                    InvalidOperationException or
+                    OverflowException)
+                {
+                    // TODO: Подключить централизованное
+                    // логирование ошибок конфигурации.
+                    return StartFailed(
+                        CoreLinkResult.BadConfig,
+                        $"Core map encoding failed: {ex}");
                 }
 
-                if (!_mapProvider.TryLoad(
-                        mapId,
-                        out CoreMap? coreMap) ||
-                    coreMap is null)
-                {
-                    return StartFailed(CoreLinkResult.BadConfig);
-                }
-
-                if (!_mapProvider.TryLoadRxMap(
-                        mapId,
+                if (!MapProvider.TryBuildRx(
+                        map!,
                         out RxMapConfiguration? rxMap,
                         out string? mapError) ||
                     rxMap is null)
                 {
-                    ReportError(
-                        mapError ?? "Rx map loading failed.");
-
-                    return StartFailed(CoreLinkResult.BadConfig);
+                    return StartFailed(
+                        CoreLinkResult.BadConfig,
+                        mapError ?? "Rx map building failed.");
                 }
 
                 if (!RxDefinitionMapper.TryCreate(
@@ -143,20 +178,18 @@ public sealed class CoreLinkClient
                         out var definitions,
                         out string? definitionError))
                 {
-                    ReportError(
+                    return StartFailed(
+                        CoreLinkResult.BadConfig,
                         definitionError ??
                         "Rx definitions are invalid.");
-
-                    return StartFailed(CoreLinkResult.BadConfig);
                 }
 
                 if (coreMap.BufferLength <= 0 ||
                     coreMap.BufferLength != definitions.Length)
                 {
-                    ReportError(
+                    return StartFailed(
+                        CoreLinkResult.BadConfig,
                         "Core/Rx value count mismatch.");
-
-                    return StartFailed(CoreLinkResult.BadConfig);
                 }
 
                 var coreBuffer =
@@ -184,7 +217,9 @@ public sealed class CoreLinkClient
 
                 if (result != CoreLinkResult.Ok)
                 {
-                    return StartFailed(result);
+                    return StartFailed(
+                        result,
+                        $"Core start failed: {coreStatus}.");
                 }
 
                 _coreStarted = true;
@@ -207,29 +242,41 @@ public sealed class CoreLinkClient
 
                 if (rx.IsFaulted)
                 {
-                    ReportError(
+                    return StartFailed(
+                        CoreLinkResult.SessionError,
                         rx.LastError ?? "Rx start failed.");
-
-                    _state = CoreLinkState.Faulted;
-                    return CoreLinkResult.SessionError;
                 }
 
                 return CoreLinkResult.Ok;
             }
             catch (Exception ex)
             {
+                // TODO: Подключить централизованное
+                // логирование исключений Client.Start.
+                _lastError = ex.ToString();
                 ReportError("CoreLink start failed.", ex);
+
                 _state = CoreLinkState.Faulted;
                 return CoreLinkResult.SessionError;
             }
         }
     }
 
-    private CoreLinkResult StartFailed(CoreLinkResult result)
+
+
+    private CoreLinkResult StartFailed(
+        CoreLinkResult result,
+        string message)
     {
+        _lastError = message;
         _state = CoreLinkState.Faulted;
+
+        ReportError(
+            $"CoreLink.Client.Start: {result}. {message}");
+
         return result;
     }
+
 
     /// <summary>
     /// Публичное получение snapshot через Core.
@@ -843,6 +890,144 @@ public sealed class CoreLinkClient
             // Причина: ошибка формирования подписки.
             return Observable.Empty<RxValue>();
         }
+    }
+
+    private static bool TryValidateMap(
+        CoreLinkMap? map,
+        out string? error)
+    {
+        error = null;
+
+        if (map is null)
+        {
+            error = "CoreLink map is null.";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(map.IpAddress) ||
+            !IPAddress.TryParse(
+                map.IpAddress,
+                out IPAddress? address) ||
+            address.AddressFamily != AddressFamily.InterNetwork)
+        {
+            error = "Invalid IPv4 address.";
+            return false;
+        }
+
+        if (map.Port == 0)
+        {
+            error = "Invalid Modbus port.";
+            return false;
+        }
+
+        if (map.UnitId == 0)
+        {
+            error = "Invalid Modbus UnitId.";
+            return false;
+        }
+
+        if (map.PollFunctionCode is not (3 or 4))
+        {
+            error = "Unsupported polling function code.";
+            return false;
+        }
+
+        if (map.PollIntervalMs <= 0 ||
+            map.RxIntervalMs <= 0)
+        {
+            error = "Invalid polling or Rx interval.";
+            return false;
+        }
+
+        if (map.ConnectTimeoutMs <= 0 ||
+            map.RequestTimeoutMs <= 0 ||
+            map.ReconnectDelayMs <= 0)
+        {
+            error = "Invalid connection timeout configuration.";
+            return false;
+        }
+
+        if (!Enum.IsDefined(map.RegisterOrder))
+        {
+            error = "Invalid register order.";
+            return false;
+        }
+
+        if (map.Registers is null ||
+            map.Registers.Length == 0)
+        {
+            error = "Register map is empty.";
+            return false;
+        }
+
+        if (map.SupportedUnitSystemIds is null ||
+            map.SupportedUnitSystemIds.Length == 0)
+        {
+            error = "Supported unit systems are empty.";
+            return false;
+        }
+
+        int minAddress = int.MaxValue;
+        int maxAddress = 0;
+
+        var occupied = new HashSet<int>();
+
+        foreach (var register in map.Registers)
+        {
+            if (string.IsNullOrWhiteSpace(register.Name))
+            {
+                error = "Register name is empty.";
+                return false;
+            }
+
+            int length = register.Type switch
+            {
+                RegisterType.Word => 1,
+                RegisterType.Float => 2,
+                _ => 0
+            };
+
+            if (length == 0)
+            {
+                error = $"Invalid register type: {register.Name}.";
+                return false;
+            }
+
+            int start = register.Address;
+            int end = start + length - 1;
+
+            if (end > ushort.MaxValue)
+            {
+                error =
+                    $"Register address overflow: {register.Name}.";
+                return false;
+            }
+
+            for (int addressIndex = start;
+                 addressIndex <= end;
+                 addressIndex++)
+            {
+                if (!occupied.Add(addressIndex))
+                {
+                    error =
+                        $"Overlapping register: {register.Name}, " +
+                        $"address {addressIndex}.";
+                    return false;
+                }
+            }
+
+            minAddress = Math.Min(minAddress, start);
+            maxAddress = Math.Max(maxAddress, end);
+        }
+
+        if (maxAddress - minAddress + 1 > 125)
+        {
+            error =
+                "Modbus polling range exceeds 125 registers.";
+            return false;
+        }
+
+        return true;
     }
 
 

@@ -3,7 +3,6 @@ using System.Buffers.Binary;
 using System.Net;
 using CoreLink.Contracts.Maps;
 using CoreLink.Contracts.Registers;
-using CoreLink.Maps.Definitions;
 
 namespace CoreLink.Maps.Configuration;
 
