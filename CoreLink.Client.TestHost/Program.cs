@@ -684,6 +684,445 @@ if (args.Contains("--client-write-cycle"))
 }
 
 
+if (args.Contains("--register-order"))
+{
+    // RegisterOrder integration test.
+    // Only loopback PLC and Holding Registers 21..23.
+
+    int orderPassedCount = 0;
+    const int orderTotalTests = 8;
+    bool orderStopFailed = false;
+
+    RegisterOrder[] orders =
+    [
+        RegisterOrder.ABCD,
+        RegisterOrder.BADC,
+        RegisterOrder.CDAB,
+        RegisterOrder.DCBA
+    ];
+
+    // Distinct bytes ensure swaps are observable.
+    const float testFloat = 123.456f;
+    const ushort testWord = 0xA55A;
+
+    static ushort SwapTestBytes(ushort value) =>
+        (ushort)((value >> 8) | (value << 8));
+
+    static ushort[] ExpectedWords(
+        float value,
+        RegisterOrder order)
+    {
+        uint bits =
+            BitConverter.SingleToUInt32Bits(value);
+
+        ushort low = (ushort)bits;
+        ushort high = (ushort)(bits >> 16);
+
+        return order switch
+        {
+            RegisterOrder.ABCD => [low, high],
+            RegisterOrder.BADC =>
+                [SwapTestBytes(low), SwapTestBytes(high)],
+            RegisterOrder.CDAB => [high, low],
+            RegisterOrder.DCBA =>
+                [SwapTestBytes(high), SwapTestBytes(low)],
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(order))
+        };
+    }
+
+    foreach (RegisterOrder order in orders)
+    {
+        // CoreLinkMap properties are init-only.
+        // Create a separate map for each session.
+        var orderMap = new CoreLinkMap
+        {
+            IpAddress = map.IpAddress,
+            Port = map.Port,
+            UnitId = map.UnitId,
+            PollFunctionCode = map.PollFunctionCode,
+            PollIntervalMs = map.PollIntervalMs,
+            RxIntervalMs = map.RxIntervalMs,
+            ConnectTimeoutMs = map.ConnectTimeoutMs,
+            RequestTimeoutMs = map.RequestTimeoutMs,
+            ReconnectDelayMs = map.ReconnectDelayMs,
+            RegisterOrder = order,
+            Registers = map.Registers,
+            SupportedUnitSystemIds =
+                map.SupportedUnitSystemIds
+        };
+
+        var orderClient = new CoreLinkClient(
+            new CSharpCoreAdapter());
+
+        CoreLinkResult orderStart =
+            orderClient.Start(orderMap);
+
+        Console.WriteLine();
+        Console.WriteLine(
+            $"========== {order} ==========");
+
+        if (orderStart != CoreLinkResult.Ok)
+        {
+            Console.WriteLine(
+                $"START FAILED: {orderStart}");
+
+            orderStopFailed = true;
+            break;
+        }
+
+        try
+        {
+            using var orderTcp = new TcpClient();
+
+            using var orderCts =
+                new CancellationTokenSource(
+                    TimeSpan.FromMilliseconds(ioTimeoutMs));
+
+            await orderTcp.ConnectAsync(
+                ip,
+                port,
+                orderCts.Token);
+
+            using var orderMaster =
+                new ModbusFactory().CreateMaster(orderTcp);
+
+            ushort[] floatWords =
+                ExpectedWords(testFloat, order);
+
+            // Test 1: Float32.
+            await orderClient.WriteFloatAsync(
+                21, testFloat);
+
+            CoreWriteStatus floatStatus =
+                orderClient.LastWriteStatus;
+
+            ushort[] floatActual =
+                await orderMaster.ReadHoldingRegistersAsync(
+                    unitId, 21, 2)
+                .WaitAsync(
+                    TimeSpan.FromMilliseconds(ioTimeoutMs));
+
+            bool floatPassed =
+                floatStatus == CoreWriteStatus.Ok &&
+                floatActual.SequenceEqual(floatWords);
+
+            Console.WriteLine(
+                $"FLOAT: {floatStatus}, " +
+                $"expected=[{string.Join(',', floatWords)}], " +
+                $"actual=[{string.Join(',', floatActual)}]");
+
+            Console.WriteLine(
+                floatPassed ? "PASSED" : "FAILED");
+
+            if (floatPassed)
+                orderPassedCount++;
+
+            // Test 2: Float32 + Word in one batch.
+            await orderClient.WriteBatchAsync(
+                21,
+                [
+                    CoreWriteValue.Float(testFloat),
+                    CoreWriteValue.Word(testWord)
+                ]);
+
+            CoreWriteStatus batchStatus =
+                orderClient.LastWriteStatus;
+
+            ushort[] batchExpected =
+            [
+                floatWords[0],
+                floatWords[1],
+                testWord
+            ];
+
+            ushort[] batchActual =
+                await orderMaster.ReadHoldingRegistersAsync(
+                    unitId, 21, 3)
+                .WaitAsync(
+                    TimeSpan.FromMilliseconds(ioTimeoutMs));
+
+            bool batchPassed =
+                batchStatus == CoreWriteStatus.Ok &&
+                batchActual.SequenceEqual(batchExpected);
+
+            Console.WriteLine(
+                $"BATCH: {batchStatus}, " +
+                $"expected=[{string.Join(',', batchExpected)}], " +
+                $"actual=[{string.Join(',', batchActual)}]");
+
+            Console.WriteLine(
+                batchPassed ? "PASSED" : "FAILED");
+
+            if (batchPassed)
+                orderPassedCount++;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(
+                $"ORDER TEST EXCEPTION: {ex}");
+        }
+        finally
+        {
+            CoreLinkResult orderStop =
+                await orderClient.StopAsync();
+
+            Console.WriteLine(
+                $"CORE STOP: {orderStop}");
+
+            if (orderStop != CoreLinkResult.Ok)
+                orderStopFailed = true;
+        }
+    }
+
+    bool orderSuccess =
+        orderPassedCount == orderTotalTests &&
+        !orderStopFailed;
+
+    Console.WriteLine();
+    Console.WriteLine(
+        $"REGISTER ORDER TESTS: " +
+        $"{orderPassedCount}/{orderTotalTests}");
+
+    Console.WriteLine(
+        orderSuccess
+            ? "ALL REGISTER ORDER TESTS PASSED"
+            : "REGISTER ORDER TESTS FAILED");
+
+    Environment.ExitCode = orderSuccess ? 0 : 1;
+    return;
+}
+
+
+if (args.Contains("--write-boundaries"))
+{
+    // Boundary tests for public CoreLink write API.
+    // Only loopback simulator 127.0.0.1:1502.
+    // Test data is written to HR20..23.
+
+    int boundaryPassed = 0;
+    const int boundaryTotal = 7;
+    bool boundaryStopOk = false;
+
+    var boundaryClient = new CoreLinkClient(
+        new CSharpCoreAdapter());
+
+    ushort[] baseline = [1111, 2222, 3333, 4444];
+
+    async Task<bool> CheckBoundaryAsync(
+        string name,
+        CoreWriteStatus expectedStatus,
+        IModbusMaster master,
+        bool checkRegisters = true)
+    {
+        CoreWriteStatus actualStatus =
+            boundaryClient.LastWriteStatus;
+
+        bool statusOk = actualStatus == expectedStatus;
+        bool registersOk = true;
+
+        if (checkRegisters)
+        {
+            ushort[] actualRegisters =
+                await master.ReadHoldingRegistersAsync(
+                    unitId, 20, 4)
+                .WaitAsync(
+                    TimeSpan.FromMilliseconds(ioTimeoutMs));
+
+            registersOk =
+                actualRegisters.SequenceEqual(baseline);
+        }
+
+        bool passed = statusOk && registersOk;
+
+        Console.WriteLine();
+        Console.WriteLine($"TEST: {name}");
+        Console.WriteLine(
+            $"Status: {actualStatus}, Expected: {expectedStatus}");
+        Console.WriteLine(
+            $"Registers unchanged: {registersOk}");
+        Console.WriteLine(
+            passed ? "PASSED" : "FAILED");
+
+        if (passed)
+            boundaryPassed++;
+
+        return passed;
+    }
+
+    CoreLinkResult boundaryStart =
+        boundaryClient.Start(map);
+
+    if (boundaryStart != CoreLinkResult.Ok)
+    {
+        Console.WriteLine(
+            $"START FAILED: {boundaryStart}");
+
+        Environment.ExitCode = 1;
+        return;
+    }
+
+    try
+    {
+        using var boundaryTcp = new TcpClient();
+
+        using var boundaryCts =
+            new CancellationTokenSource(
+                TimeSpan.FromMilliseconds(ioTimeoutMs));
+
+        await boundaryTcp.ConnectAsync(
+            ip, port, boundaryCts.Token);
+
+        using var boundaryMaster =
+            new ModbusFactory().CreateMaster(boundaryTcp);
+
+        // Establish known register contents.
+        await boundaryClient.WriteBatchAsync(
+            20,
+            [
+                CoreWriteValue.Word(baseline[0]),
+                CoreWriteValue.Word(baseline[1]),
+                CoreWriteValue.Word(baseline[2]),
+                CoreWriteValue.Word(baseline[3])
+            ]);
+
+        ushort[] initial =
+            await boundaryMaster.ReadHoldingRegistersAsync(
+                unitId, 20, 4);
+
+        if (boundaryClient.LastWriteStatus !=
+                CoreWriteStatus.Ok ||
+            !initial.SequenceEqual(baseline))
+        {
+            throw new InvalidOperationException(
+                "Baseline initialization failed.");
+        }
+
+        // 1. Empty Batch.
+        await boundaryClient.WriteBatchAsync(
+            20,
+            Array.Empty<CoreWriteValue>());
+
+        await CheckBoundaryAsync(
+            "Empty Batch",
+            CoreWriteStatus.BadConfig,
+            boundaryMaster);
+
+        // 2. More than 123 Word registers.
+        CoreWriteValue[] tooManyWords =
+            Enumerable.Repeat(
+                CoreWriteValue.Word(9999), 124)
+            .ToArray();
+
+        await boundaryClient.WriteBatchAsync(
+            20, tooManyWords);
+
+        await CheckBoundaryAsync(
+            "124 Word Registers",
+            CoreWriteStatus.BadConfig,
+            boundaryMaster);
+
+        // 3. 62 Float32 = 124 physical registers.
+        CoreWriteValue[] tooManyFloats =
+            Enumerable.Repeat(
+                CoreWriteValue.Float(12.5f), 62)
+            .ToArray();
+
+        await boundaryClient.WriteBatchAsync(
+            20, tooManyFloats);
+
+        await CheckBoundaryAsync(
+            "124 Registers via Float32",
+            CoreWriteStatus.BadConfig,
+            boundaryMaster);
+
+        // 4. Float32 would exceed address 65535.
+        await boundaryClient.WriteFloatAsync(
+            ushort.MaxValue, 12.5f);
+
+        await CheckBoundaryAsync(
+            "Float32 Address Overflow",
+            CoreWriteStatus.BadConfig,
+            boundaryMaster);
+
+        // 5. Two Word values would exceed address 65535.
+        await boundaryClient.WriteBatchAsync(
+            ushort.MaxValue,
+            [
+                CoreWriteValue.Word(111),
+                CoreWriteValue.Word(222)
+            ]);
+
+        await CheckBoundaryAsync(
+            "Batch Address Overflow",
+            CoreWriteStatus.BadConfig,
+            boundaryMaster);
+
+        // Stop before testing the lifecycle contract.
+        CoreLinkResult boundaryStop =
+            await boundaryClient.StopAsync();
+
+        boundaryStopOk =
+            boundaryStop == CoreLinkResult.Ok;
+
+        Console.WriteLine();
+        Console.WriteLine(
+            $"CORE STOP: {boundaryStop}");
+
+        // 6. Word write after Stop.
+        await boundaryClient.WriteWordAsync(
+            20, 9999);
+
+        await CheckBoundaryAsync(
+            "WriteWord After Stop",
+            CoreWriteStatus.Stopped,
+            boundaryMaster);
+
+        // 7. Float write after Stop.
+        await boundaryClient.WriteFloatAsync(
+            21, 99.5f);
+
+        await CheckBoundaryAsync(
+            "WriteFloat After Stop",
+            CoreWriteStatus.Stopped,
+            boundaryMaster);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine(
+            $"BOUNDARY TEST EXCEPTION: {ex}");
+    }
+    finally
+    {
+        // Safe even if StopAsync already succeeded.
+        CoreLinkResult finalStop =
+            await boundaryClient.StopAsync();
+
+        Console.WriteLine(
+            $"FINAL STOP: {finalStop}");
+    }
+
+    bool boundarySuccess =
+        boundaryPassed == boundaryTotal &&
+        boundaryStopOk;
+
+    Console.WriteLine();
+    Console.WriteLine(
+        $"WRITE BOUNDARY TESTS: " +
+        $"{boundaryPassed}/{boundaryTotal}");
+
+    Console.WriteLine(
+        boundarySuccess
+            ? "ALL WRITE BOUNDARY TESTS PASSED"
+            : "WRITE BOUNDARY TESTS FAILED");
+
+    Environment.ExitCode =
+        boundarySuccess ? 0 : 1;
+
+    return;
+}
+
+
 var outputLock = new object();
 
 var client = new CoreLinkClient(
