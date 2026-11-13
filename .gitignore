@@ -37,3 +37,4 @@ Thumbs.db
 *.so
 *.dylib
 *.pdb
+/artifacts/
