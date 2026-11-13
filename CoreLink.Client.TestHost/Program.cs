@@ -228,6 +228,462 @@ if (pollingFunctionCode is not (3 or 4))
     return;
 }
 
+
+if (args.Contains("--client-write"))
+{
+    // Public CoreLink write API integration test.
+    // Writes are permitted only to emulator HR20..23.
+    // The endpoint safety check has already passed.
+
+    var writeClient = new CoreLinkClient(
+        new CSharpCoreAdapter());
+
+    int passed = 0;
+    const int total = 3;
+
+    async Task<bool> VerifyAsync(
+        string testName,
+        ushort address,
+        ushort[] expected,
+        IModbusMaster master)
+    {
+        CoreWriteStatus status = writeClient.LastWriteStatus;
+
+        ushort[] actual = await master.ReadHoldingRegistersAsync(
+            unitId,
+            address,
+            (ushort)expected.Length);
+
+        bool valuesMatch = actual.SequenceEqual(expected);
+
+        bool ok =
+            status == CoreWriteStatus.Ok &&
+            valuesMatch;
+
+        Console.WriteLine();
+        Console.WriteLine($"TEST: {testName}");
+        Console.WriteLine($"Status  : {status}");
+        Console.WriteLine(
+            $"Expected: [{string.Join(", ", expected)}]");
+        Console.WriteLine(
+            $"Actual  : [{string.Join(", ", actual)}]");
+        Console.WriteLine(ok ? "PASSED" : "FAILED");
+
+        return ok;
+    }
+
+    try
+    {
+        CoreLinkResult start = writeClient.Start(map);
+
+        if (start != CoreLinkResult.Ok)
+        {
+            Console.WriteLine(
+                $"CORE START FAILED: {start}");
+
+            Console.WriteLine(writeClient.LastError);
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        using var tcp = new TcpClient();
+
+        using var connectCts =
+            new CancellationTokenSource(
+                TimeSpan.FromMilliseconds(ioTimeoutMs));
+
+        await tcp.ConnectAsync(
+            ip,
+            port,
+            connectCts.Token);
+
+        using var master =
+            new ModbusFactory().CreateMaster(tcp);
+
+        // 1. Word -> FC06.
+        await writeClient.WriteWordAsync(20, 1234);
+
+        if (await VerifyAsync(
+            "WriteWordAsync FC06",
+            20,
+            [1234],
+            master))
+        {
+            passed++;
+        }
+
+        // 2. Float32 -> FC16.
+        // ABCD: low word followed by high word.
+        const float floatValue = 25.25f;
+
+        await writeClient.WriteFloatAsync(
+            21,
+            floatValue);
+
+        uint floatBits =
+            BitConverter.SingleToUInt32Bits(floatValue);
+
+        ushort[] floatRegisters =
+        [
+            (ushort)floatBits,
+            (ushort)(floatBits >> 16)
+        ];
+
+        if (await VerifyAsync(
+            "WriteFloatAsync FC16",
+            21,
+            floatRegisters,
+            master))
+        {
+            passed++;
+        }
+
+        // 3. Batch: Float32 + Word -> one FC16.
+        const float batchFloat = 34.5f;
+        const ushort batchWord = 4321;
+
+        await writeClient.WriteBatchAsync(
+            21,
+            [
+                CoreWriteValue.Float(batchFloat),
+                CoreWriteValue.Word(batchWord)
+            ]);
+
+        uint batchBits =
+            BitConverter.SingleToUInt32Bits(batchFloat);
+
+        ushort[] batchRegisters =
+        [
+            (ushort)batchBits,
+            (ushort)(batchBits >> 16),
+            batchWord
+        ];
+
+        if (await VerifyAsync(
+            "WriteBatchAsync FC16",
+            21,
+            batchRegisters,
+            master))
+        {
+            passed++;
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine(
+            $"CLIENT WRITE TEST EXCEPTION: {ex}");
+    }
+    finally
+    {
+        CoreLinkResult stop = await writeClient.StopAsync();
+
+        Console.WriteLine();
+        Console.WriteLine($"CORE STOP: {stop}");
+
+        if (stop != CoreLinkResult.Ok)
+            passed = -1;
+    }
+
+    Console.WriteLine();
+    Console.WriteLine(
+        $"CLIENT WRITE TESTS: {passed}/{total}");
+
+    bool success = passed == total;
+
+    Console.WriteLine(
+        success
+            ? "ALL CLIENT WRITE TESTS PASSED"
+            : "CLIENT WRITE TESTS FAILED");
+
+    Environment.ExitCode = success ? 0 : 1;
+    return;
+}
+
+
+if (args.Contains("--client-write-cycle"))
+{
+    // Stress test: public write API during PLC failures.
+    // Endpoint safety check has already passed.
+    // Writes only Holding Registers 20..23.
+
+    const int durationSecondsCycle = 110;
+    const int delayMs = 700;
+
+    var testClient = new CoreLinkClient(
+        new CSharpCoreAdapter());
+
+    int verifiedMask = 0;
+    int cycleWriteOk = 0;
+    int unavailable = 0;
+    int unexpected = 0;
+    int verified = 0;
+    int verificationUnavailable = 0;
+
+    bool failureObserved = false;
+    bool recoveredAfterFailure = false;
+
+    CoreLinkResult start = testClient.Start(map);
+
+    if (start != CoreLinkResult.Ok)
+    {
+        Console.WriteLine(
+            $"START FAILED: {start}, {testClient.LastError}");
+
+        Environment.ExitCode = 1;
+        return;
+    }
+
+    async Task<bool?> VerifyAsync(
+        ushort address,
+        ushort[] expected)
+    {
+        try
+        {
+            using var tcp = new TcpClient();
+
+            using var deadline =
+                new CancellationTokenSource(
+                    TimeSpan.FromMilliseconds(ioTimeoutMs));
+
+            await tcp.ConnectAsync(
+                ip, port, deadline.Token);
+
+            using var master =
+                new ModbusFactory().CreateMaster(tcp);
+
+            ushort[] actual =
+                await master.ReadHoldingRegistersAsync(
+                    unitId,
+                    address,
+                    (ushort)expected.Length)
+                .WaitAsync(
+                    TimeSpan.FromMilliseconds(ioTimeoutMs));
+
+            bool matched = actual.SequenceEqual(expected);
+
+            if (!matched)
+            {
+                Console.WriteLine(
+                    $"VERIFY MISMATCH: expected " +
+                    $"[{string.Join(',', expected)}], " +
+                    $"actual [{string.Join(',', actual)}]");
+            }
+
+            return matched;
+        }
+        catch (Exception ex) when (
+            ex is SocketException or
+            IOException or
+            TimeoutException or
+            OperationCanceledException or
+            ObjectDisposedException ||
+            ex.GetType().Name.Contains(
+                "SlaveException",
+                StringComparison.Ordinal))
+        {
+            return null;
+        }
+    }
+
+    CoreLinkResult cycleStopResult =
+        CoreLinkResult.SessionError;
+
+    var watch = Stopwatch.StartNew();
+
+    try
+    {
+        int iteration = 0;
+
+        while (watch.Elapsed.TotalSeconds <
+               durationSecondsCycle)
+        {
+            iteration++;
+
+            int operation = (iteration - 1) % 3;
+
+            ushort word =
+                (ushort)(1000 + iteration);
+
+            float floatValue =
+                25.25f + iteration;
+
+            ushort[] expected;
+            ushort address;
+            string name;
+
+            if (operation == 0)
+            {
+                name = "FC06 WORD";
+                address = 20;
+                expected = [word];
+
+                await testClient.WriteWordAsync(
+                    address, word);
+            }
+            else if (operation == 1)
+            {
+                name = "FC16 FLOAT";
+                address = 21;
+
+                uint bits =
+                    BitConverter.SingleToUInt32Bits(
+                        floatValue);
+
+                expected =
+                [
+                    (ushort)bits,
+                    (ushort)(bits >> 16)
+                ];
+
+                await testClient.WriteFloatAsync(
+                    address, floatValue);
+            }
+            else
+            {
+                name = "FC16 BATCH";
+                address = 21;
+
+                uint bits =
+                    BitConverter.SingleToUInt32Bits(
+                        floatValue);
+
+                expected =
+                [
+                    (ushort)bits,
+                    (ushort)(bits >> 16),
+                    word
+                ];
+
+                await testClient.WriteBatchAsync(
+                    address,
+                    [
+                        CoreWriteValue.Float(floatValue),
+                        CoreWriteValue.Word(word)
+                    ]);
+            }
+
+            CoreWriteStatus status =
+                testClient.LastWriteStatus;
+
+            Console.WriteLine(
+                $"[{watch.Elapsed:mm\\:ss}] " +
+                $"{name}: {status}");
+
+            if (status == CoreWriteStatus.Ok)
+            {
+                cycleWriteOk++;
+
+                bool? result =
+                    await VerifyAsync(
+                        address, expected);
+
+                if (result == true)
+                {
+                    verified++;
+
+                    verifiedMask |= 1 << operation;
+
+                    Console.WriteLine(
+                        "  READBACK VERIFIED");
+
+                    if (failureObserved)
+                        recoveredAfterFailure = true;
+                }
+                else if (result == false)
+                {
+                    unexpected++;
+                    Console.WriteLine(
+                        "  READBACK FAILED");
+                }
+                else
+                {
+                    verificationUnavailable++;
+
+                    Console.WriteLine(
+                        "  READBACK UNAVAILABLE");
+                }
+            }
+            else if (status is
+                     CoreWriteStatus.Disconnected or
+                     CoreWriteStatus.Timeout or
+                     CoreWriteStatus.Failed)
+            {
+                unavailable++;
+                failureObserved = true;
+            }
+            else
+            {
+                unexpected++;
+
+                Console.WriteLine(
+                    $"  UNEXPECTED STATUS: {status}");
+            }
+
+            await Task.Delay(delayMs);
+        }
+    }
+    catch (Exception ex)
+    {
+        unexpected++;
+
+        Console.WriteLine(
+            $"TEST EXCEPTION: {ex}");
+    }
+    finally
+    {
+        cycleStopResult =
+            await testClient.StopAsync();
+
+        Console.WriteLine(
+            $"CORE STOP: {cycleStopResult}");
+    }
+
+    bool passed =
+        verifiedMask == 0b111 &&
+        verified > 0 &&
+        unavailable > 0 &&
+        recoveredAfterFailure &&
+        unexpected == 0 &&
+        cycleStopResult == CoreLinkResult.Ok;
+
+    Console.WriteLine();
+    Console.WriteLine(
+        "========== CLIENT WRITE CYCLE ==========");
+
+    Console.WriteLine(
+        $"Write OK              : {cycleWriteOk}");
+
+    Console.WriteLine(
+        $"Unavailable           : {unavailable}");
+
+    Console.WriteLine(
+        $"Readback verified     : {verified}");
+
+    Console.WriteLine(
+        $"Readback unavailable  : {verificationUnavailable}");
+
+    Console.WriteLine(
+        $"Unexpected            : {unexpected}");
+
+    Console.WriteLine(
+        $"Methods verified mask : {verifiedMask}/7");
+
+    Console.WriteLine(
+        $"Recovered after error : {recoveredAfterFailure}");
+
+    Console.WriteLine(
+        $"Stop                  : {cycleStopResult}");
+
+    Console.WriteLine(
+        passed
+            ? "CLIENT WRITE CYCLE PASSED"
+            : "CLIENT WRITE CYCLE FAILED");
+
+    Environment.ExitCode = passed ? 0 : 1;
+    return;
+}
+
+
 var outputLock = new object();
 
 var client = new CoreLinkClient(
