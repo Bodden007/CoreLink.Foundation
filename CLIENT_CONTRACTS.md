@@ -6,22 +6,36 @@
 
 Client — единая публичная точка приложения. Он владеет lifecycle, двумя буферами snapshot и Rx; **не** реализует Modbus polling, декодирование или выбор единиц. Путь: `Client → ICore → Adapter.CSharp → Core → Transport → PLC`. Rx получает snapshot только через Client.
 
-## API в актуальной ветке GitHub
+## API в актуальной ветке GitHub (13.11.2026)
 
 ```csharp
-CoreLinkClient(IMapProvider mapProvider, ICore core);
-CoreLinkResult Start(string mapId);
+CoreLinkClient(ICore core);
+CoreLinkResult Start(CoreLinkMap map);
 SnapshotStatus GetSnapshot(out ReadOnlyMemory<float> values);
 Task<CoreLinkResult> StopAsync();
 void Stop();
-CoreLinkState State;
-CoreMap? CoreMap;
-IObservable<RxValue>? Values;
-IObservable<SnapshotStatus>? Statuses;
+Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
+ReadSingleAsync(...);
+WriteWordAsync(...);
+WriteFloatAsync(...);
+WriteBatchAsync(...);
 IObservable<RxValue> ObserveValue(int valueId);
 ```
 
-`ICore` содержит `Start(CoreMap)`, `Stop()`, `GetSnapshot(float*, int)`, `ReadAsync(IReadOnlyList<int>)`, `StatusChanged`. Чтение уже есть в исходниках GitHub.
+Также доступны `State`, `LastError`, `LastSingleReadStatus`, `LastWriteStatus`, `Values`, `Statuses`, `CoreMap`. Сигнатуры с многоточием здесь перечисляют имена методов, не являются копируемым кодом. Актуальное определение всегда проверять в исходниках.
+
+## Актуальный контракт выбора реализации ядра (13.11.2026)
+
+**Инвариант:** `CoreLink.Client` зависит от `ICore`, а не от конкретной реализации ядра. `ICore` определён в `CoreLink.Contracts`. Конкретный адаптер выбирается на внешней точке композиции приложения и передаётся в конструктор `CoreLinkClient(ICore core)`. Это намеренное архитектурное решение, а не утечка внутренней реализации.
+
+- Сегодня реализация `ICore` — `CoreLink.Adapter.CSharp.CSharpCoreAdapter`, который использует `CoreLink.Core` и `CoreLink.Transport`.
+- Будущая реализация на Rust может быть подключена через другой адаптер `ICore` с сохранением публичного API Client, **если** выполняет тот же контракт. Rust/FFI-адаптер пока не считается реализованным.
+- `CoreLink.Client` не должен создавать `CSharpCoreAdapter` самостоятельно, добавлять к нему прямую зависимость или определять платформенную реализацию ядра. Не скрывать выбор реализации внутри Client.
+- Приложение работает с технологическими данными через `CoreLink.Client` и `CoreLink.Contracts`; точка композиции приложения дополнительно знает выбранный адаптер только для его создания. Это не означает, что ViewModel или UI должны вызывать методы адаптера.
+- При поставке готовых DLL необходимы все транзитивные managed-зависимости выбранной реализации. Наличие `Adapter.CSharp.dll` в комплекте поставки не делает методы адаптера публичным прикладным API.
+- Контракты и карты доступны извне: приложение составляет `CoreLinkMap` и вызывает `Start(CoreLinkMap)`. `ValueId` определяется позицией в карте, не адресом Modbus.
+- Текущие методы записи: `WriteWordAsync`, `WriteFloatAsync`, `WriteBatchAsync`; интеграционное тестирование и промышленное подтверждение этих путей следует оценивать отдельно от наличия методов.
+- Отдельная сборка managed DLL не тождественна NativeAOT-публикации приложения или созданию native-библиотеки Rust.
 
 ## Реализованный ReadAsync — 11.11.2026
 
@@ -48,7 +62,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 
 ## Запись
 
-**Публичного `CoreLinkClient.WriteAsync` и контракта Write в ICore ещё нет.** FC06/FC16 есть во внутреннем Transport, но диагностический TestHost пишет через отдельное соединение. Не считать это нагрузочным тестом приоритетов CoreLink Dispatcher. Отдельный проект дальнейшей реализации — тот же путь `Client → ICore → Core → Transport`, без второго соединения и Dispatcher, с явными статусами и валидацией.
+**Историческая запись (11–12.11.2026):** тогда публичный контракт записи ещё не был реализован; сейчас имеются `WriteWordAsync`, `WriteFloatAsync`, `WriteBatchAsync`. FC06/FC16 есть во внутреннем Transport, но диагностический TestHost пишет через отдельное соединение. Не считать это нагрузочным тестом приоритетов CoreLink Dispatcher. Отдельный проект дальнейшей реализации — тот же путь `Client → ICore → Core → Transport`, без второго соединения и Dispatcher, с явными статусами и валидацией.
 
 ## Локальные испытания
 
@@ -64,7 +78,7 @@ Task<CoreReadResult> ReadAsync(IReadOnlyList<int> valueIds);
 
 11.11.2026 локально выполнены циклы FC04/FC03 polling с OFFLINE, HANG и RECOVERY. После разделения тестовых адресов Holding Registers на `0–16` (технологические) и `20–23` (диагностическая запись) исчезли ошибки `Unknown Measurme`. Последний FC03 прогон: Snapshot 67/120, ReadAsync 49/58, 154/154 завершённых физических запросов, 0 нарушений тестовых инвариантов, Stop `Ok` за 4,1 мс.
 
-**Публичная запись не реализована; разработка и тестирование записи временно отложены.** Последующие изменения исправлять точечно после завершения чтения и единого сценария тестирования.
+**Историческое состояние на 11.11.2026:** публичная запись тогда не была реализована. По состоянию на 13.11.2026 методы записи добавлены; результаты их тестов оценивать по актуальному README и TestHost. Последующие изменения исправлять точечно после завершения чтения и единого сценария тестирования.
 
 
 ## Публичная адресная Rx-подписка — 12.11.2026
