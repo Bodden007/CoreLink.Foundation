@@ -1,53 +1,32 @@
 
+using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using CoreLink.Maps;
-using System.Diagnostics;
+using System.Reactive.Linq;
 using CoreLink.Client.Configuration;
 using CoreLink.Client.Lifecycle;
 using CoreLink.Client.Results;
 using CoreLink.Contracts.Core;
 using CoreLink.Contracts.Maps;
-using CoreLink.Rx.Runtime;
 using CoreLink.Contracts.Registers;
-using System.Buffers.Binary;
-using System.Reactive.Linq;
+using CoreLink.Maps;
+using CoreLink.Rx.Runtime;
 
 namespace CoreLink.Client;
 
 /// <summary>
 /// Публичная точка управления CoreLink.
-///
-/// Client владеет конфигурацией сессии, буферами
+/// Владеет конфигурацией сессии, буферами
 /// и жизненным циклом Core и Rx.
-///
-/// Rx получает snapshot только через Client.
-/// Client не выполняет самостоятельный polling.
+/// Polling выполняется внутри Core.
 /// </summary>
 public sealed class CoreLinkClient
 {
-
     private readonly ICore _core;
-
-    private string? _lastError;
-
-    public string? LastError
-    {
-        get
-        {
-            lock (_lifecycleLock)
-                return _lastError;
-        }
-    }
-
-    public CoreLinkClient(ICore core)
-    {
-        _core = core;
-    }
-    private readonly ICore _core;
-
     private readonly object _lifecycleLock = new();
 
+    private string? _lastError;
     private CoreMap? _coreMap;
 
     private float[]? _coreBuffer;
@@ -59,6 +38,26 @@ public sealed class CoreLinkClient
     private bool _coreStarted;
 
     private CoreLinkState _state = CoreLinkState.Created;
+
+    private int _lastSingleReadStatus =
+        (int)CoreReadStatus.Stopped;
+
+    private int _lastWriteStatus =
+        (int)CoreWriteStatus.Stopped;
+
+    public CoreLinkClient(ICore core)
+    {
+        _core = core;
+    }
+
+    public string? LastError
+    {
+        get
+        {
+            lock (_lifecycleLock)
+                return _lastError;
+        }
+    }
 
     public CoreLinkState State
     {
@@ -103,22 +102,27 @@ public sealed class CoreLinkClient
         }
     }
 
-    public CoreLinkClient(
-        IMapProvider mapProvider,
-        ICore core)
-    {
-        _mapProvider = mapProvider;
-        _core = core;
-    }
+    /// <summary>
+    /// Последний статус одиночного чтения.
+    /// </summary>
+    public CoreReadStatus LastSingleReadStatus =>
+        (CoreReadStatus)Volatile.Read(
+            ref _lastSingleReadStatus);
 
     /// <summary>
-    /// Загружает обе проекции карты, запускает Core,
-    /// затем создаёт и запускает Rx.
-    ///
-    /// Повторный Start после Stop не поддерживается
-    /// существующим контрактом экземпляра ICore.
+    /// Последний статус операции записи.
     /// </summary>
+    public CoreWriteStatus LastWriteStatus =>
+        (CoreWriteStatus)Volatile.Read(
+            ref _lastWriteStatus);
 
+    /// <summary>
+    /// Проверяет карту, формирует конфигурации
+    /// Core и Rx, затем запускает систему.
+    ///
+    /// При невалидной карте Core не запускается.
+    /// Повторный Start после Stop не поддерживается.
+    /// </summary>
     public CoreLinkResult Start(CoreLinkMap? map)
     {
         lock (_lifecycleLock)
@@ -134,15 +138,21 @@ public sealed class CoreLinkClient
 
             try
             {
-                if (!TryValidateMap(map, out string? error))
+                if (!TryValidateMap(
+                        map,
+                        out string? error))
+                {
                     return StartFailed(
                         CoreLinkResult.BadConfig,
                         error ?? "Invalid CoreLink map.");
+                }
 
                 if (_core is null)
+                {
                     return StartFailed(
                         CoreLinkResult.SessionError,
                         "Core implementation is null.");
+                }
 
                 CoreMap coreMap;
 
@@ -198,7 +208,8 @@ public sealed class CoreLinkClient
                 var rxBuffer =
                     new float[coreMap.BufferLength];
 
-                CoreStatus coreStatus = _core.Start(coreMap);
+                CoreStatus coreStatus =
+                    _core.Start(coreMap);
 
                 CoreLinkResult result = coreStatus switch
                 {
@@ -254,16 +265,21 @@ public sealed class CoreLinkClient
                 // TODO: Подключить централизованное
                 // логирование исключений Client.Start.
                 _lastError = ex.ToString();
-                ReportError("CoreLink start failed.", ex);
+
+                ReportError(
+                    "CoreLink start failed.",
+                    ex);
 
                 _state = CoreLinkState.Faulted;
+
                 return CoreLinkResult.SessionError;
             }
         }
     }
 
-
-
+    /// <summary>
+    /// Сохраняет причину отказа запуска.
+    /// </summary>
     private CoreLinkResult StartFailed(
         CoreLinkResult result,
         string message)
@@ -277,13 +293,10 @@ public sealed class CoreLinkClient
         return result;
     }
 
-
     /// <summary>
-    /// Публичное получение snapshot через Core.
-    ///
-    /// Использует собственный буфер Client.
-    /// Повторный вызов может изменить ранее
-    /// возвращённый ReadOnlyMemory.
+    /// Получает snapshot через Core.
+    /// Возвращаемый ReadOnlyMemory использует
+    /// повторно применяемый буфер Client.
     /// </summary>
     public unsafe SnapshotStatus GetSnapshot(
         out ReadOnlyMemory<float> values)
@@ -318,20 +331,19 @@ public sealed class CoreLinkClient
             }
             catch (Exception ex)
             {
-                ReportError("Snapshot read failed.", ex);
+                // TODO: Централизованное логирование.
+                ReportError(
+                    "Snapshot read failed.",
+                    ex);
+
                 return SnapshotStatus.BadBuffer;
             }
         }
     }
 
     /// <summary>
-    /// Асинхронно читает значения PLC по ValueId.
-    ///
-    /// Не использует snapshot и не изменяет Rx.
-    /// При любой ошибке возвращает общий статус
-    /// без частично прочитанных значений.
-    ///
-    /// Исключения не выходят за границу Client.
+    /// Читает значения PLC по ValueId.
+    /// Не изменяет snapshot или Rx.
     /// </summary>
     public async Task<CoreReadResult> ReadAsync(
         IReadOnlyList<int> valueIds)
@@ -368,8 +380,8 @@ public sealed class CoreLinkClient
         }
         catch (Exception ex)
         {
-            // TODO: Заменить временный Trace
-            // централизованным логированием CoreLink.
+            // TODO: Подключить централизованное
+            // логирование ошибок Read.
             ReportError(
                 "Direct register read failed.",
                 ex);
@@ -384,9 +396,7 @@ public sealed class CoreLinkClient
 
     /// <summary>
     /// SnapshotReader, принадлежащий Rx.
-    ///
     /// Использует отдельный постоянный буфер.
-    /// Публичный GetSnapshot не изменяет этот буфер.
     /// </summary>
     private unsafe SnapshotStatus ReadRxSnapshot(
         out ReadOnlyMemory<float> values)
@@ -421,17 +431,19 @@ public sealed class CoreLinkClient
             }
             catch (Exception ex)
             {
-                ReportError("Rx snapshot read failed.", ex);
+                // TODO: Централизованное логирование.
+                ReportError(
+                    "Rx snapshot read failed.",
+                    ex);
+
                 return SnapshotStatus.BadBuffer;
             }
         }
     }
 
     /// <summary>
-    /// Основной механизм остановки.
-    ///
-    /// Конкурентные вызовы получают одну задачу.
-    /// Сначала останавливается Rx, затем Core.
+    /// Остановка Rx, затем Core.
+    /// Конкурентные Stop получают одну Task.
     /// </summary>
     public Task<CoreLinkResult> StopAsync()
     {
@@ -475,6 +487,7 @@ public sealed class CoreLinkClient
         }
         catch (Exception ex)
         {
+            // TODO: Централизованное логирование.
             ReportError("Rx stop failed.", ex);
         }
 
@@ -498,8 +511,13 @@ public sealed class CoreLinkClient
                 }
                 catch (Exception ex)
                 {
-                    ReportError("Core stop failed.", ex);
+                    // TODO: Централизованное логирование.
+                    ReportError(
+                        "Core stop failed.",
+                        ex);
+
                     _state = CoreLinkState.Faulted;
+
                     return CoreLinkResult.SessionError;
                 }
 
@@ -509,6 +527,7 @@ public sealed class CoreLinkClient
                         $"Unexpected Core stop status: {status}");
 
                     _state = CoreLinkState.Faulted;
+
                     return CoreLinkResult.SessionError;
                 }
 
@@ -542,6 +561,9 @@ public sealed class CoreLinkClient
         }
     }
 
+    /// <summary>
+    /// Временный механизм диагностики.
+    /// </summary>
     private static void ReportError(
         string message,
         Exception? exception = null)
@@ -557,35 +579,16 @@ public sealed class CoreLinkClient
         }
         catch (Exception)
         {
-            // Ошибки диагностики не должны нарушать Client.
+            // TODO: Диагностика отказа логгера.
+            // Ошибка диагностики не должна
+            // нарушать работу Client.
         }
     }
 
-
-    // Последний результат одиночного Read.
-    // Диагностическое состояние Client,
-    // не состояние соединения или snapshot.
-    private int _lastSingleReadStatus =
-        (int)CoreReadStatus.Stopped;
-
-    /// <summary>
-    /// Последний статус одиночного чтения.
-    /// Запрашивается потребителем при необходимости.
-    /// </summary>
-    public CoreReadStatus LastSingleReadStatus =>
-        (CoreReadStatus)Volatile.Read(
-            ref _lastSingleReadStatus);
-
     /// <summary>
     /// Выполняет одиночное чтение PLC.
-    ///
-    /// Новое значение передаётся потребителю
-    /// исключительно при успешном статусе Core.
-    ///
-    /// При ошибке существующее значение не изменяется.
+    /// Значение обновляется только при успехе.
     /// Snapshot и Rx не затрагиваются.
-    ///
-    /// Все ошибки обрабатываются внутри Client.
     /// </summary>
     public async Task ReadSingleAsync(
         ushort address,
@@ -622,24 +625,20 @@ public sealed class CoreLinkClient
             if (result.Status != CoreReadStatus.Ok)
                 return;
 
-            // Только успешный результат имеет право
-            // изменять значение потребителя.
             updateValue(result.Value);
         }
         catch (Exception ex)
         {
             // TODO: Подключить централизованное
-            // логирование ошибок Single Read Client.
-            ReportError("Single Read failed.", ex);
+            // логирование ошибок Single Read.
+            ReportError(
+                "Single Read failed.",
+                ex);
 
             SetSingleReadStatus(CoreReadStatus.Failed);
         }
     }
 
-    /// <summary>
-    /// Сохраняет диагностический статус последней
-    /// операции одиночного чтения.
-    /// </summary>
     private void SetSingleReadStatus(CoreReadStatus status)
     {
         Volatile.Write(
@@ -647,24 +646,6 @@ public sealed class CoreLinkClient
             (int)status);
     }
 
-
-    // Последний результат пользовательской операции Write.
-    // Не является состоянием TCP-соединения или polling.
-    private int _lastWriteStatus =
-        (int)CoreWriteStatus.Stopped;
-
-    /// <summary>
-    /// Последний статус операции записи.
-    ///
-    /// Потребитель запрашивает его при необходимости.
-    /// </summary>
-    public CoreWriteStatus LastWriteStatus =>
-        (CoreWriteStatus)Volatile.Read(
-            ref _lastWriteStatus);
-
-    /// <summary>
-    /// Обновляет диагностический статус записи.
-    /// </summary>
     private void SetWriteStatus(CoreWriteStatus status)
     {
         Volatile.Write(
@@ -673,10 +654,8 @@ public sealed class CoreLinkClient
     }
 
     /// <summary>
-    /// Записывает один Word через FC06.
-    ///
+    /// Записывает Word через FC06.
     /// Не изменяет snapshot.
-    /// Не выполняет повторную запись.
     /// </summary>
     public Task WriteWordAsync(
         ushort address,
@@ -688,9 +667,7 @@ public sealed class CoreLinkClient
 
     /// <summary>
     /// Записывает Float32 через FC16.
-    ///
-    /// RegisterOrder берётся из текущей сессии.
-    /// Не выполняет контрольное чтение.
+    /// Порядок слов берётся из текущей сессии.
     /// </summary>
     public Task WriteFloatAsync(
         ushort address,
@@ -702,10 +679,6 @@ public sealed class CoreLinkClient
 
     /// <summary>
     /// Записывает последовательность Word/Float32.
-    ///
-    /// Потребитель передаёт типизированные значения.
-    /// Client создаёт одноразовый бинарный дескриптор.
-    ///
     /// Один Batch соответствует одному FC16.
     /// Максимум 123 физических регистра.
     /// </summary>
@@ -713,7 +686,8 @@ public sealed class CoreLinkClient
         ushort startAddress,
         IReadOnlyList<CoreWriteValue> values)
     {
-        if (values is null || values.Count == 0 ||
+        if (values is null ||
+            values.Count == 0 ||
             values.Count > 123)
         {
             SetWriteStatus(CoreWriteStatus.BadConfig);
@@ -724,8 +698,6 @@ public sealed class CoreLinkClient
         {
             int registerCount = 0;
 
-            // Полностью проверяем запрос до создания
-            // дескриптора и передачи данных в Core.
             foreach (CoreWriteValue value in values)
             {
                 int length = value.Type switch
@@ -757,8 +729,6 @@ public sealed class CoreLinkClient
                 return;
             }
 
-            // Временный дескриптор принадлежит Client.
-            // Он сохраняется до завершения операции Core.
             byte[] descriptor =
                 new byte[4 + values.Count * 5];
 
@@ -802,21 +772,18 @@ public sealed class CoreLinkClient
         catch (Exception ex)
         {
             // TODO: Подключить централизованное
-            // логирование формирования Batch-дескриптора.
-            ReportError("Batch Write failed.", ex);
+            // логирование формирования Batch.
+            ReportError(
+                "Batch Write failed.",
+                ex);
 
             SetWriteStatus(CoreWriteStatus.Failed);
         }
     }
 
     /// <summary>
-    /// Выполняет пользовательскую операцию записи.
-    ///
-    /// Проверяет lifecycle Client.
-    /// Получает статус Core и сохраняет его
-    /// для отдельной диагностики.
-    ///
-    /// Исключения не передаются ViewModel.
+    /// Выполняет пользовательскую запись.
+    /// Сохраняет результат для диагностики.
     /// </summary>
     private async Task ExecuteClientWriteAsync(
         Func<Task<CoreWriteStatus>> operation)
@@ -840,22 +807,19 @@ public sealed class CoreLinkClient
         catch (Exception ex)
         {
             // TODO: Подключить централизованное
-            // логирование ошибок Write в Client.
-            ReportError("Client Write failed.", ex);
+            // логирование ошибок Write.
+            ReportError(
+                "Client Write failed.",
+                ex);
 
             SetWriteStatus(CoreWriteStatus.Failed);
         }
     }
 
     /// <summary>
-    /// Возвращает поток изменений параметра по ValueId.
-    ///
-    /// Подписчик получает только последующие изменения.
-    /// Последнее известное значение не воспроизводится.
-    /// Не создаёт дополнительных запросов к Core.
-    ///
-    /// При ошибке возвращает пустой поток.
-    /// Исключения наружу не передаются.
+    /// Возвращает поток изменений по ValueId.
+    /// Последнее значение не воспроизводится.
+    /// Дополнительных запросов к Core нет.
     /// </summary>
     public IObservable<RxValue> ObserveValue(int valueId)
     {
@@ -867,16 +831,14 @@ public sealed class CoreLinkClient
                     _rx is null ||
                     _coreMap is null)
                 {
-                    // TODO: Добавить централизованное логирование.
-                    // Причина: Client или Rx недоступен.
+                    // TODO: Централизованное логирование.
                     return Observable.Empty<RxValue>();
                 }
 
                 if ((uint)valueId >=
                     (uint)_coreMap.BufferLength)
                 {
-                    // TODO: Добавить централизованное логирование.
-                    // Причина: некорректный ValueId.
+                    // TODO: Централизованное логирование.
                     return Observable.Empty<RxValue>();
                 }
 
@@ -884,14 +846,21 @@ public sealed class CoreLinkClient
                     value => value.ValueId == valueId);
             }
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // TODO: Добавить централизованное логирование.
-            // Причина: ошибка формирования подписки.
+            // TODO: Централизованное логирование.
+            ReportError(
+                "ObserveValue failed.",
+                ex);
+
             return Observable.Empty<RxValue>();
         }
     }
 
+    /// <summary>
+    /// Проверяет карту до запуска Core.
+    /// Невалидная конфигурация блокирует polling.
+    /// </summary>
     private static bool TryValidateMap(
         CoreLinkMap? map,
         out string? error)
@@ -989,7 +958,8 @@ public sealed class CoreLinkClient
 
             if (length == 0)
             {
-                error = $"Invalid register type: {register.Name}.";
+                error =
+                    $"Invalid register type: {register.Name}.";
                 return false;
             }
 
@@ -1029,6 +999,4 @@ public sealed class CoreLinkClient
 
         return true;
     }
-
-
 }

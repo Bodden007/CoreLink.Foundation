@@ -1,3 +1,5 @@
+
+using CoreLink.Contracts.Maps;
 using CoreLink.Contracts.Registers;
 
 namespace CoreLink.Maps.Definitions;

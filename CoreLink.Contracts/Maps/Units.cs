@@ -1,5 +1,5 @@
 
-namespace CoreLink.Maps.Definitions;
+namespace CoreLink.Contracts.Maps;
 
 /// <summary>
 /// Единица одного параметра в заданной системе PLC.
